@@ -207,8 +207,12 @@ static cinc__fiber *fiber_get(cinc__worker *w) {
   return fiber_new(w->rt);
 }
 
-// an arena that grew past one spare chunk gives them all back, the next task starts small again.
+// an arena that grew past one spare chunk gives them all back, the next task starts small again. most tasks
+// never leave the borrowed chunk, or never touch their scratch arenas, and cost a compare here.
 static void arena_recycle(cilo_arena *a) {
+  if (!a->chunk && !a->spare) return;
+  if (a->chunk && a->chunk->kind == CILO__BORROWED && !a->chunk->prev && !a->spare &&
+      a->cur == (char *)(a->chunk + 1)) return;
   cilo_arena_reset(a);
   if (a->spare && a->spare->prev) cilo_arena_trim(a);
 }
@@ -316,6 +320,8 @@ static uint64_t timers_fire(cinc__worker *w) {
 /* ========================================================================================================== */
 
 void cinc__notify(cinc__worker *w) {
+  // a load first, so a busy worker's line is not pulled over for nothing.
+  if (!atomic_load_explicit(&w->sleeping, memory_order_seq_cst)) return;
   if (!atomic_exchange_explicit(&w->sleeping, 0, memory_order_seq_cst)) return;
 #if CINC__KQUEUE
   struct kevent ev;
@@ -868,7 +874,10 @@ static void run(cinc__worker *w, cinc__thread *th, cinc_task *t) {
     t->frames = &f->frames;
     t->scratch = f->scratch;
   }
-  atomic_exchange_explicit(&t->wstate, CINC__IDLE, memory_order_acq_rel);
+  // a yield leaves it idle, a wake up notified: only the latter needs the exchange.
+  if (atomic_load_explicit(&t->wstate, memory_order_relaxed) != CINC__IDLE)
+    atomic_exchange_explicit(&t->wstate, CINC__IDLE, memory_order_acq_rel);
+  w->worked = true;
   th->current = t;
   cilo_scratch_bind(t->scratch);
   resume(th, f);
@@ -911,6 +920,27 @@ static void cancel_groups(cinc__worker *w) {
     if (t->group && atomic_load_explicit(&t->group->cancelled, memory_order_acquire)) cinc_cancel(t);
 }
 
+// work often comes back within microseconds, the other half of a channel ping pong for instance. a worker that
+// just ran something spins a little before paying for a sleep, and its wakers for a system call. io gets a look
+// now and then meanwhile.
+static bool spin(cinc__worker *w, uint64_t next) {
+  enum : uint64_t { SPIN_NS = 20'000, POLL_NS = 5'000 };
+  uint64_t start = cinc__now_ns(), polled = start;
+  uint64_t until = start + SPIN_NS < next ? start + SPIN_NS : next;
+  for (uint64_t now = start; now < until; now = cinc__now_ns()) {
+    for (int i = 0; i < 32; i++) {
+      if (cinc__mpsc_pending(&w->inbox)) return true;
+      cinc__pause();
+    }
+    if (w->io_waiters && now - polled >= POLL_NS) {
+      polled = now;
+      cinc__poller_wait(w, 0);
+      if (w->runq_head) return true;
+    }
+  }
+  return false;
+}
+
 static void worker_loop(cinc__worker *w, cinc__thread *th) {
   cinc__runtime *rt = w->rt;
   for (;;) {
@@ -930,6 +960,8 @@ static void worker_loop(cinc__worker *w, cinc__thread *th) {
       continue;
     }
     if (atomic_load_explicit(&rt->stop, memory_order_acquire)) break;
+    if (w->worked && spin(w, next)) continue;
+    w->worked = false;
     atomic_store_explicit(&w->sleeping, 1, memory_order_seq_cst);
     if (cinc__mpsc_pending(&w->inbox) || atomic_load_explicit(&rt->stop, memory_order_seq_cst) ||
         atomic_load_explicit(&rt->epoch, memory_order_seq_cst) != w->epoch) {
@@ -1108,10 +1140,10 @@ cinc_error cinc_yield(void) {
     cinc_task *t = th->current;
     cinc__runq_push(th->worker, t);
     suspend(th, t->fiber, CINC__ACT_NONE);
-  } else {
-    sched_yield();
+    return cinc__interrupted(t);
   }
-  return cinc_check();
+  sched_yield();
+  return cinc__interrupted(cinc__cur(th));
 }
 
 /* ========================================================================================================== */

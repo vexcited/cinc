@@ -249,6 +249,8 @@ struct cinc__worker {
   uint32_t nfds;
   uint32_t io_waiters;
   uint32_t ticks;
+  // ran a task since it last slept.
+  bool worked;
   cinc__fiber *fibers;
   _Atomic(uint32_t) nfibers;
   cinc_task *detached;
