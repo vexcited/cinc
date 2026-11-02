@@ -17,4 +17,8 @@
 #undef chan_close
 #undef chan_free
 #undef range
+#undef chan_select
+#undef chan_try_select
+#undef on_send
+#undef on_recv
 #undef CINC_DSL_H

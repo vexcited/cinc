@@ -39,6 +39,8 @@ CINC_MAIN(.workers = 4) {
 | `spawn_blocking` | `blocking { ... }` |
 | `make(chan T, n)`, `for v := range ch` | `typedef chan(T) Ts;`, `make_chan(Ts, n)`, `range(v, ch) { ... }` |
 | `ch <- v`, `v := <-ch`, `close(ch)` | `chan_send(ch, v)`, `chan_recv(ch, &v)`, `chan_close(ch)` |
+| `select { case v := <-a: ... case b <- x: ... }` | `switch (chan_select(&e, on_recv(a, &v), on_send(b, x))) { case 0: ... }` |
+| `select` with a `default` case | `chan_try_select(&e, ...)`, -1 when no case is ready |
 | `tokio::sync::Mutex` | `cinc_mutex` with `locked(&m) { ... }` |
 | `go f(x)` with a `sync.WaitGroup` | `spawn_in(&group, f(x))`, `cinc_group_wait`, `cinc_group_cancel` |
 | `#[tokio::main]` | `CINC_MAIN(.workers = 4) { ... }` |
@@ -52,11 +54,31 @@ Timeouts and cancellation never unwind: once they fire, every waiting call retur
 `CINC_ERROR_CANCELLED`, and the code leaves the usual way, cleanups included. A task inherits the deadline it was
 spawned under, and cancelling a task cancels what it spawned in its blocks.
 
-Only a wait is interrupted. A channel send or receive that can go on right away does, in a cancelled task too, like a tokio future that is ready on its first poll. So a cancelled task still hands a permit back through a channel, rings a one slot channel used as a bell, or drains what is buffered, and `within(0) { ... }` turns any of them into a try. A loop that never waits checks `cinc_check()`.
+Only a wait is interrupted. A channel send or receive or a select that can go on right away does, in a cancelled task too, like a tokio future that is ready on its first poll. So a cancelled task still hands a permit back through a channel, rings a one slot channel used as a bell, or drains what is buffered, and `within(0) { ... }` turns any of them into a try. A loop that never waits checks `cinc_check()`.
 
 A spawn outside any `concurrently` block is detached, like `go f(x)`: it runs until it returns and `cinc_run` waits
 for it, but there is nothing to await. `spawn_in(&group, f(x))` detaches into a group that can be waited for or
 cancelled, which is what an accept loop wants.
+
+## Select
+
+```c
+cinc_error e;
+for (;;) {
+  switch (chan_select(&e, on_recv(jobs, &job), on_recv(quit, &signo))) {
+  case 0:
+    if (e) return 0;                                   // jobs is closed and drained
+    run(job);
+    break;
+  case 1:
+    return 0;
+  default:
+    return e;                                          // cancelled or past the deadline
+  }
+}
+```
+
+A select takes up to 16 cases and runs one of those that can go on, at random so none starves, or waits for the first one. A case on a closed channel runs with `CINC_ERROR_CLOSED` in `e`, and a case on a null channel never runs, which turns it off like a nil channel in Go. Channels are locked in address order, so selects on overlapping channels never wait on each other, and a select on both ends of a rendezvous channel meets another select.
 
 ## Memory
 
@@ -132,9 +154,7 @@ blocking, with `TCP_NODELAY` and without `SIGPIPE`.
 - **Stacks.** Mapped with a guard page and kept by the worker that ran the task, up to 1024 per worker.
 - **Blocking.** `blocking { }` moves the task's stack to a pool thread and back, and `cinc_blocking(fn, arg)` runs
   `fn` on the pool thread's own stack, for libraries with deep stacks. Names resolve there too.
-- **Waits.** Channels, mutexes, joins and groups queue their waiters behind a short lock, which a plain thread uses
-  the same way through a condition variable. A plain thread waits with `poll` and condition variables, and spawns
-  run inline.
+- **Waits.** Channels, selects, mutexes, joins and groups queue their waiters behind a short lock, which a plain thread uses the same way through a condition variable. A select queues one waiter per case and the first waker to claim it wins. A plain thread waits with `poll` and condition variables, and spawns run inline.
 
 `blocking { }` moves a stack between threads, and compilers merge calls to functions declared `const`, like glibc's
 `errno` and `pthread_self`, across its edges. Read those in a function the block calls, or use `cinc_blocking`.
@@ -152,9 +172,7 @@ cmake --preset asan -DFETCHCONTENT_SOURCE_DIR_CILO=../ciko-cilo  # or -DCINC_SAN
 cmake --build --preset asan && ctest --preset asan
 ```
 
-The tests cover spawns and awaits, nested blocks left early, deadlines and cancellation, channels and mutexes
-across workers and plain threads, the blocking pool, a TCP echo server with 120 concurrent clients, sleep accuracy,
-stack reuse, private scratch arenas and every call outside a runtime. The examples run as tests too.
+The tests cover spawns and awaits, nested blocks left early, deadlines and cancellation, channels, selects and mutexes across workers and plain threads, the blocking pool, a TCP echo server with 120 concurrent clients, sleep accuracy, stack reuse, private scratch arenas and every call outside a runtime. The examples run as tests too.
 
 ## Performance
 

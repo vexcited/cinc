@@ -22,5 +22,9 @@
 #define chan_close CINC_CHAN_CLOSE
 #define chan_free CINC_CHAN_FREE
 #define range CINC_RANGE
+#define chan_select CINC_SELECT
+#define chan_try_select CINC_TRY_SELECT
+#define on_send CINC_ON_SEND
+#define on_recv CINC_ON_RECV
 
 #endif

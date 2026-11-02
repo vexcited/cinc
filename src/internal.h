@@ -145,6 +145,10 @@ typedef struct cinc__waiter {
   void *slot;
   _Atomic(uint32_t) state;
   cinc_error result;
+  // a select's case: its shared state, which case it is and whether it is still in its channel's queue.
+  void *select;
+  uint32_t index;
+  bool queued;
 } cinc__waiter;
 
 typedef struct cinc__block {

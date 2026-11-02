@@ -379,6 +379,41 @@ void cinc_chan_free_(cinc_chan *ch);
 // it waits for the next value.
 #define CINC_RANGE(var, ch) for (typeof(*(ch).of) var; cinc_chan_recv_((ch).raw, &var) == CINC_OK;)
 
+/* go's select, over up to 16 sends and receives. it gives the index of the case that ran:                    */
+/*                                                                                                            */
+/*   cinc_error e;                                                                                            */
+/*   switch (CINC_SELECT(&e, CINC_ON_RECV(jobs, &job), CINC_ON_SEND(results, r))) {                          */
+/*   case 0: ... e is CINC_ERROR_CLOSED once jobs is closed and drained                                       */
+/*   case 1: ...                                                                                              */
+/*   default: return e;                           cancelled, or past the deadline                             */
+/*   }                                                                                                        */
+
+typedef struct cinc_case {
+  // a case on a null channel never runs, which turns a case off like a nil channel in go.
+  cinc_chan *ch;
+  // the value to send, or where the received one goes.
+  void *value;
+  bool send;
+} cinc_case;
+
+// runs one case that can go on, picked at random among the ready ones, and gives its index with CINC_OK or, on
+// a closed channel, CINC_ERROR_CLOSED in `error`. otherwise it waits for one, unless `wait` is false. -1 when
+// it gave up: the interruption in `error`, or CINC_ERROR_TIMEOUT for a select that does not wait. `error` may be
+// null.
+int cinc_select_(const cinc_case *cases, size_t count, bool wait, cinc_error *error);
+
+// the channel parameter is not named `ch`, which would rename the member.
+#define CINC_ON_SEND(channel, ...)                                                                               \
+  ((cinc_case){.ch = (channel).raw, .value = &(struct { typeof(*(channel).of) v; }){__VA_ARGS__}.v, .send = true})
+#define CINC_ON_RECV(channel, out)                                                                               \
+  ((cinc_case){.ch = (channel).raw, .value = _Generic((out), typeof((channel).of): (out))})
+#define CINC__SELECT(wait, error, ...)                                                                           \
+  cinc_select_((const cinc_case[]){__VA_ARGS__}, sizeof((const cinc_case[]){__VA_ARGS__}) / sizeof(cinc_case),   \
+               wait, error)
+#define CINC_SELECT(error, ...) CINC__SELECT(true, error, __VA_ARGS__)
+// go's select with a default case: -1 and CINC_ERROR_TIMEOUT when no case is ready.
+#define CINC_TRY_SELECT(error, ...) CINC__SELECT(false, error, __VA_ARGS__)
+
 /* ========================================================================================================== */
 /* mutexes, parking the task rather than the thread. zero initialized is unlocked.                            */
 /* ========================================================================================================== */

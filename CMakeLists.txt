@@ -38,7 +38,7 @@ set_target_properties(cinc PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(CINC_BUILD_TESTS)
   enable_testing()
-  foreach(name tasks blocks deadlines channels mutex blocking tcp sleep stacks scratch plain shutdown)
+  foreach(name tasks blocks deadlines channels select mutex blocking tcp sleep stacks scratch plain shutdown)
     add_executable(test_${name} tests/${name}.c)
     target_link_libraries(test_${name} PRIVATE cinc)
     target_compile_options(test_${name} PRIVATE -Wall -Wextra -Wpedantic)

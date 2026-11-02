@@ -1,5 +1,7 @@
 #include "internal.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ========================================================================================================== */
@@ -29,15 +31,49 @@ cinc_chan *cinc_chan_new_(size_t elem_size, size_t elem_align, size_t capacity) 
 
 void cinc_chan_free_(cinc_chan *ch) { cilo_mfree(ch); }
 
+// what the cases of one select share: the first waker to claim it wins, the other cases are dropped.
+typedef struct selecting {
+  _Atomic(uint32_t) state;
+  uint32_t which;
+} selecting;
+
+// takes the first waiter of `q` that can still be woken. a select that went on through another case, or gave
+// up, is dropped on the way.
+static cinc__waiter *take(void **q) {
+  for (cinc__waiter *w; (w = cinc__wq_pop(q));) {
+    selecting *s = w->select;
+    if (!s) return w;
+    w->queued = false;
+    uint32_t expected = CINC__QUEUED;
+    if (atomic_compare_exchange_strong_explicit(&s->state, &expected, CINC__CLAIMED, memory_order_acq_rel,
+                                                memory_order_relaxed)) {
+      s->which = w->index;
+      return w;
+    }
+  }
+  return nullptr;
+}
+
 static void claim(cinc__waiter *w, cinc_error result) {
   w->result = result;
-  atomic_store_explicit(&w->state, CINC__CLAIMED, memory_order_relaxed);
+  if (!w->select) atomic_store_explicit(&w->state, CINC__CLAIMED, memory_order_relaxed);
+}
+
+static void release(cinc__waiter *w) {
+  if (!w) return;
+  selecting *s = w->select;
+  if (!s) {
+    cinc__wq_release(w);
+    return;
+  }
+  cinc__unpark(w->task);
+  atomic_store_explicit(&s->state, CINC__RELEASED, memory_order_release);
 }
 
 static void release_all(cinc__waiter *w) {
   while (w) {
     cinc__waiter *next = w->next;
-    cinc__wq_release(w);
+    release(w);
     w = next;
   }
 }
@@ -54,7 +90,7 @@ static bool try_send(cinc_chan *ch, const void *value, cinc_error *result, cinc_
     *result = CINC_ERROR_CLOSED;
     return true;
   }
-  cinc__waiter *r = cinc__wq_pop(&ch->receivers);
+  cinc__waiter *r = take(&ch->receivers);
   if (r) {
     memcpy(r->slot, value, ch->elem);
     claim(r, CINC_OK);
@@ -75,7 +111,7 @@ static bool try_recv(cinc_chan *ch, void *out, cinc_error *result, cinc__waiter 
     ch->head = ch->head + 1 == ch->cap ? 0 : ch->head + 1;
     ch->len--;
     // a waiting sender takes the free slot.
-    cinc__waiter *s = cinc__wq_pop(&ch->senders);
+    cinc__waiter *s = take(&ch->senders);
     if (s) {
       ring_put(ch, s->slot);
       claim(s, CINC_OK);
@@ -83,7 +119,7 @@ static bool try_recv(cinc_chan *ch, void *out, cinc_error *result, cinc__waiter 
     }
     return true;
   }
-  cinc__waiter *s = cinc__wq_pop(&ch->senders);
+  cinc__waiter *s = take(&ch->senders);
   if (s) {
     memcpy(out, s->slot, ch->elem);
     claim(s, CINC_OK);
@@ -110,7 +146,7 @@ static cinc_error transfer(cinc_chan *ch, void *value, bool send) {
   if (!done) cinc__wq_push(queue, &w);
   cinc__unlock_bit(&ch->lock, 1);
   if (done) {
-    if (woken) cinc__wq_release(woken);
+    release(woken);
     return e;
   }
   e = cinc__wq_wait(th, t, &w, &ch->lock, 1, queue, true);
@@ -128,7 +164,7 @@ void cinc_chan_close_(cinc_chan *ch) {
     ch->closed = true;
     // what is buffered stays for the receivers, only the waiters are let go.
     for (void **q = &ch->senders; q; q = q == &ch->senders ? &ch->receivers : nullptr)
-      for (cinc__waiter *w; (w = cinc__wq_pop(q));) {
+      for (cinc__waiter *w; (w = take(q));) {
         claim(w, CINC_ERROR_CLOSED);
         w->next = woken;
         woken = w;
@@ -136,6 +172,117 @@ void cinc_chan_close_(cinc_chan *ch) {
   }
   cinc__unlock_bit(&ch->lock, 1);
   release_all(woken);
+}
+
+/* ========================================================================================================== */
+/* select: every channel of the cases is locked in address order, so two selects never wait on each other.    */
+/* ========================================================================================================== */
+
+enum { SELECT_MAX = 16 };
+
+static uint32_t select_random(void) {
+  static thread_local uint32_t x;
+  if (!x) x = (uint32_t)cinc__now_ns() | 1;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  return x;
+}
+
+static void lock_all(cinc_chan **chans, size_t n) {
+  for (size_t i = 0; i < n; i++) cinc__lock_bit(&chans[i]->lock, 1);
+}
+
+static void unlock_all(cinc_chan **chans, size_t n) {
+  for (size_t i = 0; i < n; i++) cinc__unlock_bit(&chans[i]->lock, 1);
+}
+
+// under the locks: runs the first case that needs no wait, from a random one on so none is starved.
+static int select_ready(const cinc_case *cases, size_t count, cinc_error *result, cinc__waiter **woken) {
+  size_t from = select_random() % count;
+  for (size_t k = 0; k < count; k++) {
+    size_t i = (from + k) % count;
+    const cinc_case *c = &cases[i];
+    if (!c->ch) continue;
+    if (c->send ? try_send(c->ch, c->value, result, woken) : try_recv(c->ch, c->value, result, woken))
+      return (int)i;
+  }
+  return -1;
+}
+
+int cinc_select_(const cinc_case *cases, size_t count, bool wait, cinc_error *error) {
+  if (count > SELECT_MAX) {
+    fprintf(stderr, "cinc: a select takes at most %d cases, it got %zu\n", SELECT_MAX, count);
+    abort();
+  }
+  cinc_error ignored;
+  if (!error) error = &ignored;
+  cinc_chan *chans[SELECT_MAX];
+  size_t n = 0;
+  for (size_t i = 0; i < count; i++) {
+    cinc_chan *ch = cases[i].ch;
+    if (!ch) continue;
+    size_t at = n;
+    while (at && (uintptr_t)chans[at - 1] > (uintptr_t)ch) at--;
+    if (at && chans[at - 1] == ch) continue;
+    memmove(chans + at + 1, chans + at, (n - at) * sizeof *chans);
+    chans[at] = ch;
+    n++;
+  }
+
+  cinc__thread *th = cinc__self();
+  cinc_task *t = cinc__cur(th);
+  cinc__waiter *woken = nullptr;
+  selecting s = {.state = CINC__QUEUED};
+  cinc__waiter ws[SELECT_MAX];
+  lock_all(chans, n);
+  int which = count ? select_ready(cases, count, error, &woken) : -1;
+  if (which < 0 && wait)
+    for (size_t i = 0; i < count; i++) {
+      const cinc_case *c = &cases[i];
+      if (!c->ch) continue;
+      ws[i] = (cinc__waiter){.task = t, .slot = c->value, .select = &s, .index = (uint32_t)i, .queued = true};
+      cinc__wq_push(c->send ? &c->ch->senders : &c->ch->receivers, &ws[i]);
+    }
+  unlock_all(chans, n);
+  if (which >= 0) {
+    release(woken);
+    return which;
+  }
+  if (!wait) {
+    *error = CINC_ERROR_TIMEOUT;
+    return -1;
+  }
+
+  cinc_error e = CINC_OK;
+  for (;;) {
+    uint32_t state = atomic_load_explicit(&s.state, memory_order_acquire);
+    if (state != CINC__QUEUED) break;
+    if ((e = cinc__interrupted(t)) && atomic_compare_exchange_strong_explicit(&s.state, &state, CINC__ABANDONED,
+                                                                              memory_order_acq_rel,
+                                                                              memory_order_acquire))
+      break;
+    if (!e) cinc__park(th, t, t->deadline);
+  }
+  bool won = atomic_load_explicit(&s.state, memory_order_acquire) != CINC__ABANDONED;
+  if (won) {
+    uint32_t spins = 0;
+    while (atomic_load_explicit(&s.state, memory_order_acquire) != CINC__RELEASED) cinc__backoff(&spins);
+  }
+  // the cases still queued leave before the waiters go out of scope.
+  for (size_t i = 0; i < count; i++) {
+    const cinc_case *c = &cases[i];
+    if (!c->ch) continue;
+    cinc__lock_bit(&c->ch->lock, 1);
+    if (ws[i].queued) cinc__wq_remove(c->send ? &c->ch->senders : &c->ch->receivers, &ws[i]);
+    cinc__unlock_bit(&c->ch->lock, 1);
+  }
+  if (!won) {
+    *error = e;
+    return -1;
+  }
+  *error = ws[s.which].result;
+  return (int)s.which;
 }
 
 /* ========================================================================================================== */
