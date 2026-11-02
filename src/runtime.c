@@ -333,12 +333,15 @@ void cinc__notify(cinc__worker *w) {
 #endif
 }
 
+// a task already notified is written again: a parker that saw the old notification resets it with an
+// exchange, and one of the two read modify writes then publishes the waker's condition to the other.
 void cinc__unpark(cinc_task *t) {
   uint32_t s = atomic_load_explicit(&t->wstate, memory_order_relaxed);
   do {
-    if (s == CINC__NOTIFIED || s == CINC__DEAD) return;
+    if (s == CINC__DEAD) return;
   } while (!atomic_compare_exchange_weak_explicit(&t->wstate, &s, CINC__NOTIFIED, memory_order_acq_rel,
                                                   memory_order_relaxed));
+  if (s == CINC__NOTIFIED) return;
   if (s == CINC__PARKED_THREAD) {
     // at worst a stale parker of the same task, which wakes for nothing and waits again.
     cinc__parker *p = t->parker;
@@ -362,7 +365,7 @@ static void park_worker(cinc__thread *th, cinc_task *t, uint64_t until) {
   uint32_t s = CINC__IDLE;
   if (!atomic_compare_exchange_strong_explicit(&t->wstate, &s, CINC__PARKED_WORKER, memory_order_acq_rel,
                                                memory_order_acquire)) {
-    atomic_store_explicit(&t->wstate, CINC__IDLE, memory_order_relaxed);
+    atomic_exchange_explicit(&t->wstate, CINC__IDLE, memory_order_acq_rel);
     return;
   }
   cinc__worker *w = th->worker;
@@ -377,7 +380,7 @@ static void park_thread(cinc__thread *th, cinc_task *t, uint64_t until) {
   uint32_t s = CINC__IDLE;
   if (!atomic_compare_exchange_strong_explicit(&t->wstate, &s, CINC__PARKED_THREAD, memory_order_acq_rel,
                                                memory_order_acquire)) {
-    atomic_store_explicit(&t->wstate, CINC__IDLE, memory_order_relaxed);
+    atomic_exchange_explicit(&t->wstate, CINC__IDLE, memory_order_acq_rel);
     return;
   }
   pthread_mutex_lock(&p->lock);
