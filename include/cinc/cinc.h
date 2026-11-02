@@ -433,6 +433,23 @@ void cinc__lock_leave(cinc__scope *s);
   for (cinc__scope CINC__UNIQUE(cinc__l) [[gnu::cleanup(cinc__lock_leave)]] = cinc__lock_enter(m);               \
        CINC__UNIQUE(cinc__l).once; CINC__UNIQUE(cinc__l).once = false)
 
+// go's sync.Cond, zero initialized. the wait lets `m` go, waits for a signal and locks `m` again, which is held
+// on return whatever the result. it honors the current deadline and cancellation, and wakes for a signal only,
+// but another task may change the state first: wait in a loop.
+//
+//   locked(&q->lock) {
+//     while (!q->len)
+//       if ((e = cinc_cond_wait(&q->ready, &q->lock))) break;
+//   }
+typedef struct cinc_cond {
+  _Atomic(uint32_t) lock;
+  void *waiters;
+} cinc_cond;
+
+cinc_error cinc_cond_wait(cinc_cond *c, cinc_mutex *m);
+void cinc_cond_signal(cinc_cond *c);
+void cinc_cond_broadcast(cinc_cond *c);
+
 /* ========================================================================================================== */
 /* semaphores, `cinc_sem seats = {.permits = 4};`. waiters get permits in the order they came.                */
 /* ========================================================================================================== */

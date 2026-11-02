@@ -337,6 +337,43 @@ void cinc__sem_leave(cinc__scope *s) {
 }
 
 /* ========================================================================================================== */
+/* condition variables.                                                                                       */
+/* ========================================================================================================== */
+
+cinc_error cinc_cond_wait(cinc_cond *c, cinc_mutex *m) {
+  cinc__thread *th = cinc__self();
+  cinc_task *t = cinc__cur(th);
+  cinc_error e = cinc__interrupted(t);
+  if (e) return e;
+  // queued before the mutex is let go, so a signal sent under it is never missed.
+  cinc__waiter w = {.task = t};
+  cinc__lock_bit(&c->lock, 1);
+  cinc__wq_push(&c->waiters, &w);
+  cinc__unlock_bit(&c->lock, 1);
+  cinc_unlock(m);
+  e = cinc__wq_wait(th, t, &w, &c->lock, 1, &c->waiters, true);
+  cinc_lock(m);
+  return e;
+}
+
+static void wake(cinc_cond *c, bool all) {
+  cinc__waiter *woken = nullptr;
+  cinc__lock_bit(&c->lock, 1);
+  for (cinc__waiter *w; (w = cinc__wq_pop(&c->waiters));) {
+    claim(w, CINC_OK);
+    w->next = woken;
+    woken = w;
+    if (!all) break;
+  }
+  cinc__unlock_bit(&c->lock, 1);
+  release_all(woken);
+}
+
+void cinc_cond_signal(cinc_cond *c) { wake(c, false); }
+
+void cinc_cond_broadcast(cinc_cond *c) { wake(c, true); }
+
+/* ========================================================================================================== */
 /* mutexes. the state word holds the lock, a lock on the waiter list and whether it has any.                  */
 /* ========================================================================================================== */
 
