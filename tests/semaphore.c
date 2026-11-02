@@ -114,6 +114,43 @@ static int body(void *) {
     for (int i = 0; i < 3; i++) cinc_sem_release(&none);
   }
   CHECK(order[0] == 0 && order[1] == 1 && order[2] == 2);
+
+  // taking permits back leaves the holders alone, and releases pay the difference before anyone gets in.
+  cinc_sem limit = {.permits = 2};
+  CHECK(cinc_sem_try_acquire(&limit) && cinc_sem_try_acquire(&limit));
+  cinc_sem_adjust(&limit, -1);
+  CHECK(cinc_sem_available(&limit) == 0);
+  cinc_sem_release(&limit);
+  CHECK(cinc_sem_available(&limit) == 0 && !cinc_sem_try_acquire(&limit));
+  concurrently {
+    auto w = spawn_on(1, take_one(&limit));
+    cinc_sleep(10);
+    within(0) {
+      CHECK(cinc_join(w.task) == CINC_ERROR_TIMEOUT);
+    }
+    cinc_sem_release(&limit);
+    CHECK(await(w) == CINC_OK);
+  }
+  CHECK(cinc_sem_available(&limit) == 0);
+  cinc_sem_release(&limit);
+  CHECK(cinc_sem_available(&limit) == 1);
+
+  // adding permits wakes as many waiters, in order.
+  cinc_sem grow = {};
+  next_slot = 0;
+  concurrently {
+    for (int i = 0; i < 3; i++) {
+      spawn(take_in_order(&grow, i));
+      cinc_yield();
+    }
+    cinc_sem_adjust(&grow, 2);
+    cinc_sleep(10);
+    CHECK(next_slot == 2 && order[0] == 0 && order[1] == 1);
+    cinc_sem_adjust(&grow, 1);
+  }
+  CHECK(next_slot == 3 && order[2] == 2 && cinc_sem_available(&grow) == 0);
+  cinc_sem_adjust(&grow, 0);
+  CHECK(cinc_sem_available(&grow) == 0);
   return 0;
 }
 

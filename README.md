@@ -103,7 +103,7 @@ acquired(&seats) {
 }
 ```
 
-`cinc_sem_release` never waits and never fails, and waiters get permits in the order they came. `cinc_cond_wait` lets the mutex go, waits for a signal and holds the mutex again on return, timed out and cancelled included.
+`cinc_sem_release` never waits and never fails, and waiters get permits in the order they came. `cinc_sem_adjust(&seats, delta)` changes the limit at runtime: more permits wake waiters, fewer leave the holders alone and make acquires wait until enough releases paid the difference. `cinc_cond_wait` lets the mutex go, waits for a signal and holds the mutex again on return, timed out and cancelled included.
 
 ## Memory
 

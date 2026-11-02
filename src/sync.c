@@ -293,7 +293,7 @@ cinc_error cinc_sem_acquire(cinc_sem *sem) {
   cinc__thread *th = cinc__self();
   cinc_task *t = cinc__cur(th);
   cinc__lock_bit(&sem->lock, 1);
-  if (sem->permits) {
+  if (sem->permits > 0) {
     sem->permits--;
     cinc__unlock_bit(&sem->lock, 1);
     return CINC_OK;
@@ -306,7 +306,7 @@ cinc_error cinc_sem_acquire(cinc_sem *sem) {
 
 bool cinc_sem_try_acquire(cinc_sem *sem) {
   cinc__lock_bit(&sem->lock, 1);
-  bool got = sem->permits;
+  bool got = sem->permits > 0;
   if (got) sem->permits--;
   cinc__unlock_bit(&sem->lock, 1);
   return got;
@@ -314,7 +314,8 @@ bool cinc_sem_try_acquire(cinc_sem *sem) {
 
 void cinc_sem_release(cinc_sem *sem) {
   cinc__lock_bit(&sem->lock, 1);
-  cinc__waiter *w = cinc__wq_pop(&sem->waiters);
+  // below zero, the permit pays back what an adjust took.
+  cinc__waiter *w = sem->permits < 0 ? nullptr : cinc__wq_pop(&sem->waiters);
   if (w) claim(w, CINC_OK);
   else sem->permits++;
   cinc__unlock_bit(&sem->lock, 1);
@@ -323,9 +324,24 @@ void cinc_sem_release(cinc_sem *sem) {
 
 size_t cinc_sem_available(cinc_sem *sem) {
   cinc__lock_bit(&sem->lock, 1);
-  size_t n = sem->permits;
+  ptrdiff_t n = sem->permits;
   cinc__unlock_bit(&sem->lock, 1);
-  return n;
+  return n > 0 ? (size_t)n : 0;
+}
+
+void cinc_sem_adjust(cinc_sem *sem, ptrdiff_t delta) {
+  cinc__waiter *woken = nullptr, **tail = &woken;
+  cinc__lock_bit(&sem->lock, 1);
+  sem->permits += delta;
+  for (cinc__waiter *w; sem->permits > 0 && (w = cinc__wq_pop(&sem->waiters));) {
+    sem->permits--;
+    claim(w, CINC_OK);
+    w->next = nullptr;
+    *tail = w;
+    tail = &w->next;
+  }
+  cinc__unlock_bit(&sem->lock, 1);
+  release_all(woken);
 }
 
 cinc__scope cinc__sem_enter(cinc_sem *sem) {

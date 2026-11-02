@@ -456,8 +456,9 @@ void cinc_cond_broadcast(cinc_cond *c);
 
 typedef struct cinc_sem {
   _Atomic(uint32_t) lock;
-  // the permits left. set it in the initializer only, afterwards it belongs to the calls below.
-  size_t permits;
+  // the permits left, below zero while cinc_sem_adjust took more than were free. set it in the initializer
+  // only, afterwards it belongs to the calls below.
+  ptrdiff_t permits;
   void *waiters;
 } cinc_sem;
 
@@ -467,7 +468,11 @@ cinc_error cinc_sem_acquire(cinc_sem *s);
 bool cinc_sem_try_acquire(cinc_sem *s);
 // never waits and never fails, so a cancelled task gives its permit back too.
 void cinc_sem_release(cinc_sem *s);
+// zero while the permits are below zero.
 size_t cinc_sem_available(cinc_sem *s);
+// adds `delta` permits at runtime, waking waiters, for a limit that changes. a negative one takes them back:
+// holders keep theirs, and acquires wait until enough releases paid the difference.
+void cinc_sem_adjust(cinc_sem *s, ptrdiff_t delta);
 
 cinc__scope cinc__sem_enter(cinc_sem *s);
 void cinc__sem_leave(cinc__scope *s);
