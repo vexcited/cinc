@@ -925,7 +925,8 @@ static void cancel_groups(cinc__worker *w) {
 // now and then meanwhile.
 static bool spin(cinc__worker *w, uint64_t next) {
   enum : uint64_t { SPIN_NS = 20'000, POLL_NS = 5'000 };
-  uint64_t start = cinc__now_ns(), polled = start;
+  // the first look at io is right away, registrations made by the last tasks may be waiting.
+  uint64_t start = cinc__now_ns(), polled = 0;
   uint64_t until = start + SPIN_NS < next ? start + SPIN_NS : next;
   for (uint64_t now = start; now < until; now = cinc__now_ns()) {
     for (int i = 0; i < 32; i++) {
