@@ -5,6 +5,13 @@
 
 static _Atomic(uint64_t) ticks;
 
+// glibc declares pthread_self const, so a call inlined into a blocking block could be merged with one outside.
+[[gnu::noinline]] static pthread_t thread_id(void) {
+  pthread_t t = pthread_self();
+  __asm__ volatile("" : "+r"(t));
+  return t;
+}
+
 static int ticker(void) {
   while (!cinc_sleep(1)) ticks++;
   return 0;
@@ -12,7 +19,7 @@ static int ticker(void) {
 spawnable(ticker);
 
 static void record_thread(void *p) {
-  *(pthread_t *)p = pthread_self();
+  *(pthread_t *)p = thread_id();
   CHECK(!cinc_in_task());
 }
 
@@ -32,7 +39,7 @@ static int leave_from_inside(void) {
 }
 
 static int body(void *) {
-  pthread_t worker = pthread_self(), inside = worker;
+  pthread_t worker = thread_id(), inside = worker;
   uint32_t me = cinc_worker();
   cilo_arena *arena = cinc_arena(), *seen = nullptr;
   concurrently {
@@ -40,7 +47,7 @@ static int body(void *) {
     cinc_sleep(5);
     uint64_t before = ticks;
     blocking {
-      inside = pthread_self();
+      inside = thread_id();
       seen = cinc_arena();
       CHECK(!cinc_in_task());
       usleep(100'000);
@@ -50,7 +57,7 @@ static int body(void *) {
     cancel(t);
   }
   CHECK(!pthread_equal(inside, worker));
-  CHECK(pthread_equal(pthread_self(), worker));
+  CHECK(pthread_equal(thread_id(), worker));
   CHECK(cinc_worker() == me);
   CHECK(seen == arena);
 
@@ -61,7 +68,7 @@ static int body(void *) {
 
   // a return from inside the block comes back first.
   CHECK(leave_from_inside() == 5);
-  CHECK(pthread_equal(pthread_self(), worker));
+  CHECK(pthread_equal(thread_id(), worker));
 
   // the deadline goes along, and waits on the pool block the pool thread.
   uint64_t left = 0;

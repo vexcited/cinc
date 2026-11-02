@@ -3,8 +3,9 @@
 #include <stdlib.h>
 #include <time.h>
 
-// loaded machines and docker's virtual machine wake late now and then, never early.
-enum { SLACK_MS = 25 };
+// never early. late by a few milliseconds at most on a machine of its own, but docker's virtual machine wakes even
+// a bare nanosleep 10 ms late, and more under emulation.
+enum { SLACK_MS = 50 };
 
 static _Atomic(uint64_t) worst_late, early;
 
@@ -28,11 +29,17 @@ spawnable(sleeper, uint64_t);
 
 static int body(void *) {
   static const uint64_t lengths[] = {1, 2, 5, 10, 25, 50, 100};
+  // the first round runs every path once, which emulators translate on the way.
+  sleeper(1);
+  worst_late = 0;
   for (size_t i = 0; i < sizeof lengths / sizeof *lengths; i++) sleeper(lengths[i]);
   CHECK(early == 0);
   CHECK(worst_late < SLACK_MS * 1'000'000u);
 
-  // a thousand sleepers on every worker at once.
+  // a thousand sleepers on every worker at once, once to map their stacks and once measured.
+  concurrently {
+    for (uint32_t i = 0; i < 1000; i++) spawn_on(i, sleeper(1));
+  }
   worst_late = 0;
   concurrently {
     for (uint32_t i = 0; i < 1000; i++) spawn_on(i, sleeper(1 + (uint64_t)rand() % 100));
@@ -51,6 +58,7 @@ static int body(void *) {
 int main(void) {
   CHECK(CINC_RUN(body, nullptr, .workers = 4) == 0);
   // and on a plain thread.
+  sleeper(1);
   worst_late = 0;
   sleeper(20);
   CHECK(early == 0);
