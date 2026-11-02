@@ -1,12 +1,24 @@
 cmake_minimum_required(VERSION 3.29)
-project(cinc VERSION 0.1.0 LANGUAGES C)
+project(cinc VERSION 0.1.0 LANGUAGES C ASM)
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ${PROJECT_IS_TOP_LEVEL})
+if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "build type" FORCE)
+endif()
 
-option(CINC_BUILD_EXAMPLES "compile the cinc examples" ${PROJECT_IS_TOP_LEVEL})
+option(CINC_BUILD_TESTS "build the cinc tests and benchmarks" ${PROJECT_IS_TOP_LEVEL})
+option(CINC_BUILD_EXAMPLES "build the cinc examples" ${PROJECT_IS_TOP_LEVEL})
+set(CINC_SANITIZE "" CACHE STRING "sanitizers for the whole build, cilo included: address;undefined")
+
+# set before cilo is added, so its arenas see asan too.
+if(CINC_SANITIZE)
+  list(JOIN CINC_SANITIZE "," sanitizers)
+  add_compile_options(-fsanitize=${sanitizers} -fno-omit-frame-pointer -fno-sanitize-recover=all)
+  add_link_options(-fsanitize=${sanitizers})
+endif()
 
 # a parent project may already provide cilo, otherwise it is fetched.
 include(FetchContent)
@@ -15,15 +27,38 @@ if(NOT TARGET cilo::cilo)
   FetchContent_MakeAvailable(cilo)
 endif()
 
-# headers only until the runtime exists.
-add_library(cinc INTERFACE)
+find_package(Threads REQUIRED)
+# both switches are always built, each one empty off its architecture, so universal builds work too.
+add_library(cinc STATIC src/runtime.c src/sync.c src/poll.c src/net.c src/switch_aarch64.S src/switch_x86_64.S)
 add_library(cinc::cinc ALIAS cinc)
-target_include_directories(cinc INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
-target_link_libraries(cinc INTERFACE cilo::cilo)
+target_include_directories(cinc PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
+target_link_libraries(cinc PUBLIC cilo::cilo Threads::Threads)
+target_compile_options(cinc PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Wpedantic>)
+set_target_properties(cinc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(CINC_BUILD_TESTS)
+  enable_testing()
+  foreach(name tasks blocks deadlines channels mutex blocking tcp sleep stacks scratch plain shutdown)
+    add_executable(test_${name} tests/${name}.c)
+    target_link_libraries(test_${name} PRIVATE cinc)
+    target_compile_options(test_${name} PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME ${name} COMMAND test_${name})
+    set_tests_properties(${name} PROPERTIES TIMEOUT 120)
+  endforeach()
+  add_executable(cinc_bench bench/bench.c)
+  target_link_libraries(cinc_bench PRIVATE cinc)
+  target_compile_options(cinc_bench PRIVATE -O2 -Wall -Wextra -Wpedantic)
+endif()
 
 if(CINC_BUILD_EXAMPLES)
-  # object libraries: nothing links yet, building them checks that the api compiles.
-  add_library(cinc_examples OBJECT examples/01_tasks.c examples/02_channels.c examples/03_colorless.c)
-  target_link_libraries(cinc_examples PRIVATE cinc)
-  target_compile_options(cinc_examples PRIVATE -Wall -Wextra -Wpedantic)
+  foreach(name 01_tasks 02_channels 03_colorless)
+    add_executable(${name} examples/${name}.c)
+    target_link_libraries(${name} PRIVATE cinc)
+    target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
+    if(CINC_BUILD_TESTS)
+      add_test(NAME example_${name} COMMAND ${name})
+      set_tests_properties(example_${name} PROPERTIES TIMEOUT 60)
+    endif()
+  endforeach()
 endif()
+
