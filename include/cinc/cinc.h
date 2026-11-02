@@ -195,7 +195,8 @@ void cinc__detach(cinc_group *group);
 #define CINC_FUTURE(fn) fn##__future
 
 // waits for the task and gives its result, zeroed when it was cancelled or when the wait itself timed out or
-// was cancelled. cinc_join(future.task) tells which. awaiting a void function is a void expression.
+// was cancelled. cinc_join(future.task) tells which. awaiting a void function is a void expression, and gcc wants
+// a (void) in front of an await whose result is dropped.
 cinc_error cinc_join(cinc_task *task);
 
 // every future has this layout. `future` is copied into a one element array so it is evaluated once, which makes
