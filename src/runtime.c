@@ -614,9 +614,11 @@ static void detached_remove(cinc__worker *w, cinc_task *t) {
 
 enum : uint64_t { GROUP_LIVE = (1ull << 48) - 1, GROUP_WAITER = 1ull << 48 };
 
+// the runtime is stored first, so a cancel that sees the task counted sees its runtime too. seq_cst pairs with
+// the cancel: either it sees this task, or the spawn sees the group cancelled.
 static void group_enter(cinc_group *g, cinc__runtime *rt) {
-  atomic_fetch_add_explicit(&g->state, 1, memory_order_relaxed);
   atomic_store_explicit(&g->runtime, rt, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g->state, 1, memory_order_seq_cst);
 }
 
 // with no one waiting the count drops without a lock. with waiters it drops under the lock, so a waiter
@@ -675,7 +677,7 @@ cinc_task *cinc__start(void (*entry)(void *frame), void *frame) {
     h->group = group;
     if (group) {
       group_enter(group, rt);
-      if (atomic_load_explicit(&group->cancelled, memory_order_acquire)) h->cancelled = true;
+      if (atomic_load_explicit(&group->cancelled, memory_order_seq_cst)) h->cancelled = true;
     }
     atomic_fetch_add_explicit(&rt->roots, 1, memory_order_relaxed);
   } else {
@@ -823,12 +825,19 @@ cinc_error cinc_group_wait(cinc_group *g) {
   }
 }
 
+// the runtime of an empty group may be gone, cinc_run having returned since. counted as a waiter, the cancel
+// makes the last task leave under the lock, so a task seen under it keeps its runtime alive until the unlock.
 void cinc_group_cancel(cinc_group *g) {
-  if (atomic_exchange_explicit(&g->cancelled, true, memory_order_acq_rel)) return;
-  cinc__runtime *rt = atomic_load_explicit(&g->runtime, memory_order_acquire);
-  if (!rt) return;
-  atomic_fetch_add_explicit(&rt->epoch, 1, memory_order_seq_cst);
-  for (uint32_t i = 0; i < rt->nworkers; i++) cinc__notify(&rt->workers[i]);
+  if (atomic_exchange_explicit(&g->cancelled, true, memory_order_seq_cst)) return;
+  atomic_fetch_add_explicit(&g->state, GROUP_WAITER, memory_order_seq_cst);
+  cinc__lock_bit(&g->lock, 1);
+  if (atomic_load_explicit(&g->state, memory_order_seq_cst) & GROUP_LIVE) {
+    cinc__runtime *rt = atomic_load_explicit(&g->runtime, memory_order_relaxed);
+    atomic_fetch_add_explicit(&rt->epoch, 1, memory_order_seq_cst);
+    for (uint32_t i = 0; i < rt->nworkers; i++) cinc__notify(&rt->workers[i]);
+  }
+  cinc__unlock_bit(&g->lock, 1);
+  atomic_fetch_sub_explicit(&g->state, GROUP_WAITER, memory_order_relaxed);
 }
 
 uint64_t cinc_group_live(const cinc_group *g) {

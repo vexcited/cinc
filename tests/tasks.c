@@ -138,6 +138,14 @@ static int body(void *) {
   return 7;
 }
 
+static cinc_group outlived;
+static _Atomic(int) outlived_done;
+
+static int spawn_outlived(void *) {
+  for (uint32_t i = 0; i < 8; i++) spawn_in_on(&outlived, i, bump(&outlived_done));
+  return 0;
+}
+
 int main(void) {
   CHECK(cinc_run(&(cinc_options){.workers = 4}, body, nullptr) == 7);
   CHECK(detached_done == 1);
@@ -145,5 +153,10 @@ int main(void) {
   detached_done = 0;
   CHECK(CINC_RUN(body, nullptr, .workers = 4, .stack_size = 128 << 10) == 7);
   CHECK(detached_done == 1);
+  // a group outlives the runtime its tasks ran on, cancelling it then touches no runtime.
+  CHECK(CINC_RUN(spawn_outlived, nullptr, .workers = 2) == 0);
+  CHECK(cinc_group_live(&outlived) == 0 && outlived_done == 8);
+  cinc_group_cancel(&outlived);
+  CHECK(cinc_group_wait(&outlived) == CINC_OK);
   return check_done("tasks");
 }
