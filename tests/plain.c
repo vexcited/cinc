@@ -13,7 +13,7 @@ static int note(int x) {
 }
 spawnable(note, int);
 
-static void touch(int *x) { *x += 1; }
+static void touch(void *x) { *(int *)x += 1; }
 
 static int echo_once(int listener) {
   int fd;
@@ -90,7 +90,7 @@ int main(void) {
 
   // blocking runs right here.
   int x = 0;
-  CHECK(cinc_blocking((void (*)(void *))touch, &x) == CINC_OK);
+  CHECK(cinc_blocking(touch, &x) == CINC_OK);
   blocking {
     x++;
   }
