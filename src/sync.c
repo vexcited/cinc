@@ -286,6 +286,57 @@ int cinc_select_(const cinc_case *cases, size_t count, bool wait, cinc_error *er
 }
 
 /* ========================================================================================================== */
+/* semaphores: a release hands its permit to the first waiter, so a newcomer never takes it first.            */
+/* ========================================================================================================== */
+
+cinc_error cinc_sem_acquire(cinc_sem *sem) {
+  cinc__thread *th = cinc__self();
+  cinc_task *t = cinc__cur(th);
+  cinc__lock_bit(&sem->lock, 1);
+  if (sem->permits) {
+    sem->permits--;
+    cinc__unlock_bit(&sem->lock, 1);
+    return CINC_OK;
+  }
+  cinc__waiter w = {.task = t};
+  cinc__wq_push(&sem->waiters, &w);
+  cinc__unlock_bit(&sem->lock, 1);
+  return cinc__wq_wait(th, t, &w, &sem->lock, 1, &sem->waiters, true);
+}
+
+bool cinc_sem_try_acquire(cinc_sem *sem) {
+  cinc__lock_bit(&sem->lock, 1);
+  bool got = sem->permits;
+  if (got) sem->permits--;
+  cinc__unlock_bit(&sem->lock, 1);
+  return got;
+}
+
+void cinc_sem_release(cinc_sem *sem) {
+  cinc__lock_bit(&sem->lock, 1);
+  cinc__waiter *w = cinc__wq_pop(&sem->waiters);
+  if (w) claim(w, CINC_OK);
+  else sem->permits++;
+  cinc__unlock_bit(&sem->lock, 1);
+  if (w) cinc__wq_release(w);
+}
+
+size_t cinc_sem_available(cinc_sem *sem) {
+  cinc__lock_bit(&sem->lock, 1);
+  size_t n = sem->permits;
+  cinc__unlock_bit(&sem->lock, 1);
+  return n;
+}
+
+cinc__scope cinc__sem_enter(cinc_sem *sem) {
+  return (cinc__scope){.impl = cinc_sem_acquire(sem) ? nullptr : sem, .once = true};
+}
+
+void cinc__sem_leave(cinc__scope *s) {
+  if (s->impl) cinc_sem_release(s->impl);
+}
+
+/* ========================================================================================================== */
 /* mutexes. the state word holds the lock, a lock on the waiter list and whether it has any.                  */
 /* ========================================================================================================== */
 

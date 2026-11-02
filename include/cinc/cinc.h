@@ -433,6 +433,35 @@ void cinc__lock_leave(cinc__scope *s);
   for (cinc__scope CINC__UNIQUE(cinc__l) [[gnu::cleanup(cinc__lock_leave)]] = cinc__lock_enter(m);               \
        CINC__UNIQUE(cinc__l).once; CINC__UNIQUE(cinc__l).once = false)
 
+/* ========================================================================================================== */
+/* semaphores, `cinc_sem seats = {.permits = 4};`. waiters get permits in the order they came.                */
+/* ========================================================================================================== */
+
+typedef struct cinc_sem {
+  _Atomic(uint32_t) lock;
+  // the permits left. set it in the initializer only, afterwards it belongs to the calls below.
+  size_t permits;
+  void *waiters;
+} cinc_sem;
+
+// takes a permit right away when one is left, even in a task that is cancelled or past its deadline. only a
+// wait is interrupted.
+cinc_error cinc_sem_acquire(cinc_sem *s);
+bool cinc_sem_try_acquire(cinc_sem *s);
+// never waits and never fails, so a cancelled task gives its permit back too.
+void cinc_sem_release(cinc_sem *s);
+size_t cinc_sem_available(cinc_sem *s);
+
+cinc__scope cinc__sem_enter(cinc_sem *s);
+void cinc__sem_leave(cinc__scope *s);
+
+// CINC_ACQUIRED(&seats) { ... } else { ... } holds a permit for the block, released on break and return too.
+// the else branch runs when the acquire was interrupted, cinc_check() says why.
+#define CINC_ACQUIRED(sem)                                                                                       \
+  for (cinc__scope CINC__UNIQUE(cinc__s) [[gnu::cleanup(cinc__sem_leave)]] = cinc__sem_enter(sem);               \
+       CINC__UNIQUE(cinc__s).once; CINC__UNIQUE(cinc__s).once = false)                                          \
+    if (CINC__UNIQUE(cinc__s).impl)
+
 #ifdef __cplusplus
 }
 #endif

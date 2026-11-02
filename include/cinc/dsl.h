@@ -15,6 +15,8 @@
 #define within CINC_WITHIN
 #define blocking CINC_BLOCKING
 #define locked CINC_LOCKED
+// function like, so members named `acquired`, like ciquel's stats, keep their name.
+#define acquired(sem) CINC_ACQUIRED(sem)
 #define chan CINC_CHAN
 #define make_chan CINC_MAKE_CHAN
 #define chan_send CINC_CHAN_SEND

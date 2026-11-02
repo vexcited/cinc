@@ -10,6 +10,7 @@
 #undef within
 #undef blocking
 #undef locked
+#undef acquired
 #undef chan
 #undef make_chan
 #undef chan_send
