@@ -50,45 +50,46 @@ static pthread_key_t plain_key;
 static pthread_once_t plain_once = PTHREAD_ONCE_INIT;
 
 static void plain_exit(void *p) {
-  cinc__thread *th = p;
-  cilo_arena_drop(&th->plain_arena);
-  cilo_arena_drop(&th->plain_frames);
-  if (th->parker_ready) {
-    pthread_mutex_destroy(&th->parker.lock);
-    pthread_cond_destroy(&th->parker.cond);
-    th->parker_ready = false;
+  cinc__local *l = p;
+  cilo_arena_drop(&l->arena);
+  cilo_arena_drop(&l->frames);
+  if (l->parker_ready) {
+    pthread_mutex_destroy(&l->parker.lock);
+    pthread_cond_destroy(&l->parker.cond);
   }
-  th->plain_ready = false;
+  free(l);
 }
 
 static void plain_make_key(void) { pthread_key_create(&plain_key, plain_exit); }
 
-cinc_task *cinc__plain(cinc__thread *th) {
-  if (CILO_UNLIKELY(!th->plain_ready)) {
-    th->plain = (cinc_task){.deadline = CINC__NEVER, .arena = &th->plain_arena, .frames = &th->plain_frames};
-    th->plain_ready = true;
-    pthread_once(&plain_once, plain_make_key);
-    pthread_setspecific(plain_key, th);
-  }
-  return &th->plain;
+static cinc__local *local_of(cinc__thread *th) {
+  if (CILO_LIKELY(th->local)) return th->local;
+  cinc__local *l = calloc(1, sizeof *l);
+  if (!l) cilo_oom(sizeof *l);
+  l->plain = (cinc_task){.deadline = CINC__NEVER, .arena = &l->arena, .frames = &l->frames};
+  pthread_once(&plain_once, plain_make_key);
+  pthread_setspecific(plain_key, l);
+  return th->local = l;
 }
 
+cinc_task *cinc__plain(cinc__thread *th) { return &local_of(th)->plain; }
+
 static cinc__parker *parker_of(cinc__thread *th) {
-  if (CILO_UNLIKELY(!th->parker_ready)) {
-    pthread_mutex_init(&th->parker.lock, nullptr);
+  cinc__local *l = local_of(th);
+  if (CILO_UNLIKELY(!l->parker_ready)) {
+    pthread_mutex_init(&l->parker.lock, nullptr);
 #if defined(__APPLE__)
-    pthread_cond_init(&th->parker.cond, nullptr);
+    pthread_cond_init(&l->parker.cond, nullptr);
 #else
     pthread_condattr_t attr;
     pthread_condattr_init(&attr);
     pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-    pthread_cond_init(&th->parker.cond, &attr);
+    pthread_cond_init(&l->parker.cond, &attr);
     pthread_condattr_destroy(&attr);
 #endif
-    th->parker_ready = true;
-    cinc__plain(th);
+    l->parker_ready = true;
   }
-  return &th->parker;
+  return &l->parker;
 }
 
 /* ========================================================================================================== */
@@ -678,15 +679,17 @@ cinc_task *cinc__start(void (*entry)(void *frame), void *frame) {
     if (b->cancelled || atomic_load_explicit(&t->cancelled, memory_order_relaxed)) h->cancelled = true;
   }
 
+  // a detached task on another worker may be done and freed as soon as it is pushed.
+  bool detached = h->detached;
   if (home == w) {
-    if (h->detached) detached_add(w, h);
+    if (detached) detached_add(w, h);
     cinc__runq_push(w, h);
   } else {
     h->msg = CINC__MSG_SPAWN;
     cinc__mpsc_push(&home->inbox, &h->node);
     cinc__notify(home);
   }
-  return h->detached ? nullptr : h;
+  return detached ? nullptr : h;
 }
 
 /* ========================================================================================================== */
@@ -1092,7 +1095,8 @@ cinc_error cinc_sleep(uint64_t ms) {
   if (e) return e;
   uint64_t until = cinc__after_ms(cinc__now_ns(), ms);
   for (;;) {
-    if (cinc__now_ns() >= until) return CINC_OK;
+    // a sleep that would end past the deadline times out, even when a late wake up saw both pass.
+    if (cinc__now_ns() >= until && until <= t->deadline) return CINC_OK;
     if ((e = cinc__interrupted(t))) return e;
     cinc__park(th, t, until < t->deadline ? until : t->deadline);
   }

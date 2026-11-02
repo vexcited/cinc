@@ -13,7 +13,9 @@
 #endif
 
 #if CILO_ASAN
-#include <sanitizer/common_interface_defs.h>
+// asan's fiber hooks, declared here since some toolchains ship no sanitizer headers.
+void __sanitizer_start_switch_fiber(void **fake_stack_save, const void *bottom, size_t size);
+void __sanitizer_finish_switch_fiber(void *fake_stack_save, const void **bottom_old, size_t *size_old);
 #endif
 
 static_assert(sizeof(void *) == 8, "cinc needs a 64 bit target");
@@ -295,13 +297,17 @@ struct cinc__thread {
   bool next_detach;
   bool next_targeted;
   uint32_t next_target;
+  // on the heap, freed by a thread exit destructor that may run after the thread locals are gone.
+  struct cinc__local *local;
+};
+
+typedef struct cinc__local {
   bool parker_ready;
-  bool plain_ready;
   cinc__parker parker;
   cinc_task plain;
-  cilo_arena plain_arena;
-  cilo_arena plain_frames;
-};
+  cilo_arena arena;
+  cilo_arena frames;
+} cinc__local;
 
 /* ========================================================================================================== */
 /* shared between the sources.                                                                                */
