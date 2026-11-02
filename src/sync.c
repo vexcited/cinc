@@ -29,6 +29,11 @@ cinc_chan *cinc_chan_new_(size_t elem_size, size_t elem_align, size_t capacity) 
 
 void cinc_chan_free_(cinc_chan *ch) { cilo_mfree(ch); }
 
+static void claim(cinc__waiter *w, cinc_error result) {
+  w->result = result;
+  atomic_store_explicit(&w->state, CINC__CLAIMED, memory_order_relaxed);
+}
+
 static void release_all(cinc__waiter *w) {
   while (w) {
     cinc__waiter *next = w->next;
@@ -37,48 +42,34 @@ static void release_all(cinc__waiter *w) {
   }
 }
 
-static void claim(cinc__waiter *w, cinc_error result) {
-  w->result = result;
-  atomic_store_explicit(&w->state, CINC__CLAIMED, memory_order_relaxed);
+static void ring_put(cinc_chan *ch, const void *value) {
+  size_t at = ch->head + ch->len++;
+  memcpy(ch->ring + (at < ch->cap ? at : at - ch->cap) * ch->elem, value, ch->elem);
 }
 
-cinc_error cinc_chan_send_(cinc_chan *ch, const void *value) {
-  cinc__thread *th = cinc__self();
-  cinc_task *t = cinc__cur(th);
-  cinc_error e = cinc__interrupted(t);
-  if (e) return e;
-  cinc__lock_bit(&ch->lock, 1);
+// under the lock: sends when it needs no wait, and gives a waiter to release once the lock is let go.
+static bool try_send(cinc_chan *ch, const void *value, cinc_error *result, cinc__waiter **woken) {
+  *result = CINC_OK;
   if (ch->closed) {
-    cinc__unlock_bit(&ch->lock, 1);
-    return CINC_ERROR_CLOSED;
+    *result = CINC_ERROR_CLOSED;
+    return true;
   }
   cinc__waiter *r = cinc__wq_pop(&ch->receivers);
   if (r) {
     memcpy(r->slot, value, ch->elem);
     claim(r, CINC_OK);
-    cinc__unlock_bit(&ch->lock, 1);
-    cinc__wq_release(r);
-    return CINC_OK;
+    *woken = r;
+    return true;
   }
   if (ch->len < ch->cap) {
-    size_t at = ch->head + ch->len++;
-    memcpy(ch->ring + (at < ch->cap ? at : at - ch->cap) * ch->elem, value, ch->elem);
-    cinc__unlock_bit(&ch->lock, 1);
-    return CINC_OK;
+    ring_put(ch, value);
+    return true;
   }
-  cinc__waiter w = {.task = t, .slot = (void *)value};
-  cinc__wq_push(&ch->senders, &w);
-  cinc__unlock_bit(&ch->lock, 1);
-  e = cinc__wq_wait(th, t, &w, &ch->lock, 1, &ch->senders, true);
-  return e ? e : w.result;
+  return false;
 }
 
-cinc_error cinc_chan_recv_(cinc_chan *ch, void *out) {
-  cinc__thread *th = cinc__self();
-  cinc_task *t = cinc__cur(th);
-  cinc_error e = cinc__interrupted(t);
-  if (e) return e;
-  cinc__lock_bit(&ch->lock, 1);
+static bool try_recv(cinc_chan *ch, void *out, cinc_error *result, cinc__waiter **woken) {
+  *result = CINC_OK;
   if (ch->len) {
     memcpy(out, ch->ring + ch->head * ch->elem, ch->elem);
     ch->head = ch->head + 1 == ch->cap ? 0 : ch->head + 1;
@@ -86,32 +77,49 @@ cinc_error cinc_chan_recv_(cinc_chan *ch, void *out) {
     // a waiting sender takes the free slot.
     cinc__waiter *s = cinc__wq_pop(&ch->senders);
     if (s) {
-      size_t at = ch->head + ch->len++;
-      memcpy(ch->ring + (at < ch->cap ? at : at - ch->cap) * ch->elem, s->slot, ch->elem);
+      ring_put(ch, s->slot);
       claim(s, CINC_OK);
+      *woken = s;
     }
-    cinc__unlock_bit(&ch->lock, 1);
-    if (s) cinc__wq_release(s);
-    return CINC_OK;
+    return true;
   }
   cinc__waiter *s = cinc__wq_pop(&ch->senders);
   if (s) {
     memcpy(out, s->slot, ch->elem);
     claim(s, CINC_OK);
-    cinc__unlock_bit(&ch->lock, 1);
-    cinc__wq_release(s);
-    return CINC_OK;
+    *woken = s;
+    return true;
   }
   if (ch->closed) {
-    cinc__unlock_bit(&ch->lock, 1);
-    return CINC_ERROR_CLOSED;
+    *result = CINC_ERROR_CLOSED;
+    return true;
   }
-  cinc__waiter w = {.task = t, .slot = out};
-  cinc__wq_push(&ch->receivers, &w);
+  return false;
+}
+
+// a send or a receive that can go on right away does, even in a task that is cancelled or past its deadline:
+// handing back a permit or ringing a bell from such a task still works. only a wait is interrupted.
+static cinc_error transfer(cinc_chan *ch, void *value, bool send) {
+  cinc__thread *th = cinc__self();
+  cinc_task *t = cinc__cur(th);
+  cinc__waiter *woken = nullptr, w = {.task = t, .slot = value};
+  void **queue = send ? &ch->senders : &ch->receivers;
+  cinc_error e;
+  cinc__lock_bit(&ch->lock, 1);
+  bool done = send ? try_send(ch, value, &e, &woken) : try_recv(ch, value, &e, &woken);
+  if (!done) cinc__wq_push(queue, &w);
   cinc__unlock_bit(&ch->lock, 1);
-  e = cinc__wq_wait(th, t, &w, &ch->lock, 1, &ch->receivers, true);
+  if (done) {
+    if (woken) cinc__wq_release(woken);
+    return e;
+  }
+  e = cinc__wq_wait(th, t, &w, &ch->lock, 1, queue, true);
   return e ? e : w.result;
 }
+
+cinc_error cinc_chan_send_(cinc_chan *ch, const void *value) { return transfer(ch, (void *)value, true); }
+
+cinc_error cinc_chan_recv_(cinc_chan *ch, void *out) { return transfer(ch, out, false); }
 
 void cinc_chan_close_(cinc_chan *ch) {
   cinc__waiter *woken = nullptr;

@@ -44,6 +44,18 @@ spawnable(recv_one, Nums);
 static int send_one(Nums ch, uint64_t v) { return chan_send(ch, v); }
 spawnable(send_one, Nums, uint64_t);
 
+// cancelled while asleep, then hands a value back and takes one: neither waits, so both go on. only the next
+// receive, which would wait, sees the cancellation.
+static int after_cancel(Nums in, Nums out) {
+  if (cinc_sleep(10'000) != CINC_ERROR_CANCELLED) return 1;
+  uint64_t v;
+  if (chan_recv(in, &v) != CINC_OK || v != 11) return 2;
+  if (chan_send(out, v + 1) != CINC_OK) return 3;
+  if (chan_recv(in, &v) != CINC_ERROR_CANCELLED) return 4;
+  return 0;
+}
+spawnable(after_cancel, Nums, Nums);
+
 static uint64_t ping(Nums to, Nums from, int rounds) {
   uint64_t v = 0;
   for (int i = 0; i < rounds; i++) {
@@ -157,6 +169,28 @@ static int body(void *) {
     CHECK(await(r2) == CINC_OK);
   }
   chan_free(a);
+
+  // a cancelled task still sends and receives what needs no wait, and a past deadline the same.
+  a = make_chan(Nums, 1);
+  b = make_chan(Nums, 1);
+  CHECK(chan_send(a, 11) == CINC_OK);
+  concurrently {
+    auto t = spawn_on(3, after_cancel(a, b));
+    cinc_sleep(10);
+    cancel(t);
+    CHECK(cinc_join(t.task) == CINC_ERROR_CANCELLED);
+    CHECK(*t.result == 0);
+  }
+  uint64_t back = 0;
+  CHECK(chan_recv(b, &back) == CINC_OK && back == 12);
+  within(0) {
+    CHECK(chan_send(a, 1) == CINC_OK);
+    CHECK(chan_send(a, 2) == CINC_ERROR_TIMEOUT);
+    CHECK(chan_recv(a, &back) == CINC_OK && back == 1);
+    CHECK(chan_recv(a, &back) == CINC_ERROR_TIMEOUT);
+  }
+  chan_free(a);
+  chan_free(b);
 
   // plain threads on both ends.
   a = make_chan(Nums, 0);

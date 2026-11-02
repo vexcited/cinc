@@ -351,7 +351,9 @@ cinc_error cinc_wait_shutdown(int *signo);
 
 typedef struct cinc_chan cinc_chan;
 
-// zero capacity is a rendezvous, the sender waits for a receiver. a channel works across workers.
+// zero capacity is a rendezvous, the sender waits for a receiver. a channel works across workers. a send or a
+// receive that can go on without waiting does, even in a task that is cancelled or past its deadline, so a
+// permit or a bell is still handed back from one. only a wait gives CINC_ERROR_CANCELLED or CINC_ERROR_TIMEOUT.
 cinc_chan *cinc_chan_new_(size_t elem_size, size_t elem_align, size_t capacity);
 cinc_error cinc_chan_send_(cinc_chan *ch, const void *value);
 cinc_error cinc_chan_recv_(cinc_chan *ch, void *out);
@@ -373,7 +375,8 @@ void cinc_chan_free_(cinc_chan *ch);
 #define CINC_CHAN_RECV(ch, out) cinc_chan_recv_((ch).raw, _Generic((out), typeof((ch).of): (out)))
 #define CINC_CHAN_CLOSE(ch) cinc_chan_close_((ch).raw)
 #define CINC_CHAN_FREE(ch) cinc_chan_free_((ch).raw)
-// go's `for v := range ch`: receives until the channel is closed and drained, or the task is cancelled.
+// go's `for v := range ch`: receives until the channel is closed and drained, or the task is cancelled while
+// it waits for the next value.
 #define CINC_RANGE(var, ch) for (typeof(*(ch).of) var; cinc_chan_recv_((ch).raw, &var) == CINC_OK;)
 
 /* ========================================================================================================== */

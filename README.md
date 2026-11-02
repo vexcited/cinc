@@ -52,6 +52,8 @@ Timeouts and cancellation never unwind: once they fire, every waiting call retur
 `CINC_ERROR_CANCELLED`, and the code leaves the usual way, cleanups included. A task inherits the deadline it was
 spawned under, and cancelling a task cancels what it spawned in its blocks.
 
+Only a wait is interrupted. A channel send or receive that can go on right away does, in a cancelled task too, like a tokio future that is ready on its first poll. So a cancelled task still hands a permit back through a channel, rings a one slot channel used as a bell, or drains what is buffered, and `within(0) { ... }` turns any of them into a try. A loop that never waits checks `cinc_check()`.
+
 A spawn outside any `concurrently` block is detached, like `go f(x)`: it runs until it returns and `cinc_run` waits
 for it, but there is nothing to await. `spawn_in(&group, f(x))` detaches into a group that can be waited for or
 cancelled, which is what an accept loop wants.

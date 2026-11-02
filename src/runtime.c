@@ -461,20 +461,21 @@ static void wait_released(_Atomic(uint32_t) *state) {
 }
 
 // `w` is queued behind the lock, which is released. returns CINC_OK once a waker claimed it, or the interruption
-// after taking it out of the queue.
+// after taking it out of the queue. one claimed before the interruption is seen wins.
 cinc_error cinc__wq_wait(cinc__thread *th, cinc_task *t, cinc__waiter *w, _Atomic(uint32_t) *word, uint32_t bit,
                          void **head, bool interruptible) {
   for (;;) {
-    cinc__park(th, t, interruptible ? t->deadline : CINC__NEVER);
     if (atomic_load_explicit(&w->state, memory_order_acquire) != CINC__QUEUED) break;
     cinc_error e = interruptible ? cinc__interrupted(t) : CINC_OK;
-    if (!e) continue;
-    cinc__lock_bit(word, bit);
-    bool queued = atomic_load_explicit(&w->state, memory_order_relaxed) == CINC__QUEUED;
-    if (queued) cinc__wq_remove(head, w);
-    cinc__unlock_bit(word, bit);
-    if (queued) return e;
-    break;
+    if (e) {
+      cinc__lock_bit(word, bit);
+      bool queued = atomic_load_explicit(&w->state, memory_order_relaxed) == CINC__QUEUED;
+      if (queued) cinc__wq_remove(head, w);
+      cinc__unlock_bit(word, bit);
+      if (queued) return e;
+      break;
+    }
+    cinc__park(th, t, interruptible ? t->deadline : CINC__NEVER);
   }
   wait_released(&w->state);
   return CINC_OK;
