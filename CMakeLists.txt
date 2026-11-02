@@ -23,7 +23,7 @@ endif()
 # a parent project may already provide cilo, otherwise it is fetched.
 include(FetchContent)
 if(NOT TARGET cilo::cilo)
-  FetchContent_Declare(cilo GIT_REPOSITORY ssh://git@vexcited.com/ciko/cilo.git GIT_TAG main)
+  FetchContent_Declare(cilo GIT_REPOSITORY https://code.vexcited.com/ciko/cilo.git GIT_TAG main)
   FetchContent_MakeAvailable(cilo)
 endif()
 
