@@ -24,7 +24,7 @@
 #endif
 
 /* ========================================================================================================== */
-/* reading and writing. every call tries the system call first and waits only when it would block.           */
+/* reading and writing. every call tries the system call first and waits only when it would block.            */
 /* ========================================================================================================== */
 
 static bool closed_by_peer(int err) { return err == ECONNRESET || err == EPIPE || err == ENOTCONN; }
@@ -146,6 +146,7 @@ cinc_error cinc_writev_all(int fd, const struct iovec *iov, int count) {
 /* sockets.                                                                                                   */
 /* ========================================================================================================== */
 
+#if !defined(SOCK_NONBLOCK) || !defined(__linux__)
 static void set_flags(int fd) {
   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
   fcntl(fd, F_SETFD, FD_CLOEXEC);
@@ -154,6 +155,7 @@ static void set_flags(int fd) {
   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
 #endif
 }
+#endif
 
 static int new_socket(int family) {
 #if defined(SOCK_NONBLOCK)

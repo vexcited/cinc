@@ -15,7 +15,7 @@
 #endif
 
 /* ========================================================================================================== */
-/* the per worker table of fds with waiters. registrations are one shot and redone on every wait, so a       */
+/* the per worker table of fds with waiters. registrations are one shot and redone on every wait, so a        */
 /* descriptor closed behind cinc's back, as libpq does, never leaves a stale one.                             */
 /* ========================================================================================================== */
 
@@ -130,7 +130,8 @@ static void process(cinc__worker *w, const struct kevent *evs, int n) {
 
 void cinc__poller_wait(cinc__worker *w, uint64_t timeout_ns) {
   struct kevent evs[256];
-  struct timespec ts = {.tv_sec = (time_t)(timeout_ns / 1'000'000'000u), .tv_nsec = (long)(timeout_ns % 1'000'000'000u)};
+  struct timespec ts = {.tv_sec = (time_t)(timeout_ns / 1'000'000'000u),
+                        .tv_nsec = (long)(timeout_ns % 1'000'000'000u)};
   int n = kevent(w->pfd, w->changes, w->nchanges, evs, 256, timeout_ns == CINC__NEVER ? nullptr : &ts);
   int lost = n < 0 && errno != EINTR && w->nchanges;
   w->nchanges = 0;
@@ -159,8 +160,10 @@ void cinc__poller_close(cinc__worker *w) {
 
 void cinc__poller_wait(cinc__worker *w, uint64_t timeout_ns) {
   struct epoll_event evs[256];
-  int ms = timeout_ns == CINC__NEVER ? -1 : timeout_ns > (uint64_t)INT32_MAX * 1'000'000u ? INT32_MAX
-                                                                                          : (int)((timeout_ns + 999'999u) / 1'000'000u);
+  // epoll counts in milliseconds, rounded up so a timer never fires early.
+  int ms = -1;
+  if (timeout_ns != CINC__NEVER)
+    ms = timeout_ns >= (uint64_t)INT32_MAX * 1'000'000u ? INT32_MAX : (int)((timeout_ns + 999'999u) / 1'000'000u);
   int n = epoll_wait(w->pfd, evs, 256, ms);
   for (int i = 0; i < n; i++) {
     int fd = evs[i].data.fd;
