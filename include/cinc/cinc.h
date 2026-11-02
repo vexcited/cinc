@@ -84,7 +84,8 @@ typedef struct cinc_options {
   size_t stack_size;
 } cinc_options;
 
-// runs `main` as the first task on worker 0 and returns its result once every task has finished.
+// runs `main` as the first task on worker 0, on the calling thread, and returns its result once every task has
+// finished, detached ones included. called from a task, it runs `main` right there instead.
 int cinc_run(const cinc_options *options, int (*main)(void *arg), void *arg);
 int cinc_run_main(const cinc_options *options, int (*main)(int argc, char **argv), int argc, char **argv);
 #define CINC_RUN(main, arg, ...) cinc_run(&(const cinc_options){__VA_ARGS__}, main, arg)
@@ -98,10 +99,21 @@ int cinc_run_main(const cinc_options *options, int (*main)(int argc, char **argv
   }                                                                                                              \
   static int cinc__main([[maybe_unused]] int argc, [[maybe_unused]] char **argv)
 
-// false on a plain thread, where every call below blocks the thread instead of parking a task.
+// false on a plain thread, where every call below blocks the thread instead of parking a task. a CINC_BLOCKING
+// block runs on such a thread too, with the task's arena, deadline and cancellation.
 bool cinc_in_task(void);
 uint32_t cinc_worker(void);
 uint32_t cinc_workers(void);
+
+typedef struct cinc_stats {
+  // stacks mapped since the runtime started. it stops growing once the workers' pools are warm.
+  uint64_t stacks_mapped;
+  // stacks waiting in the workers' pools.
+  uint64_t stacks_idle;
+  uint64_t blocking_threads;
+} cinc_stats;
+// zero outside a runtime.
+cinc_stats cinc_runtime_stats(void);
 
 // the current task's arena, dropped when the task returns. on a plain thread, one per thread. every task also
 // gets its own pair of cilo scratch arenas, bound on each switch, so a CILO_SCRATCH block may wait.
@@ -122,19 +134,26 @@ cinc_error cinc_yield(void);
 /*                                                                                                            */
 /* CINC_SPAWNABLE leaves the function alone, so it works on functions from other libraries too. it takes up   */
 /* to 8 parameters, and a void function gives a future of cinc_unit.                                         */
+/*                                                                                                            */
+/* a spawn inside a CINC_CONCURRENTLY block belongs to the block. outside of one, or with CINC_SPAWN_IN, it    */
+/* is detached: it runs on its own until it returns, cinc_run waits for it, and its future has no task.       */
 /* ========================================================================================================== */
 
 typedef struct cinc_task cinc_task;
+typedef struct cinc_group cinc_group;
 typedef struct cinc_unit {
   char unit;
 } cinc_unit;
 
-// zeroed memory from the current task's arena, rewound when the innermost CINC_CONCURRENTLY block ends. a spawn
-// costs a pointer bump, no malloc.
+// zeroed memory from the current task's frame arena, kept apart from cinc_arena() and rewound when the
+// innermost CINC_CONCURRENTLY block ends. a spawn costs a pointer bump, no malloc. a detached frame lives as long
+// as its task.
 void *cinc__frame(size_t size, size_t align);
 cinc_task *cinc__start(void (*entry)(void *frame), void *frame);
 // the next spawn of the current task lands on `worker` instead of the current one.
 void cinc__target(uint32_t worker);
+// the next spawn of the current task is detached into `group`, null for none.
+void cinc__detach(cinc_group *group);
 
 #define CINC_SPAWNABLE(fn, ...)                                                                                  \
   static_assert(_Generic(&fn, typeof(fn(CINC__ZEROS(__VA_ARGS__))) (*)(CINC__TYPES(__VA_ARGS__)): true,          \
@@ -167,18 +186,42 @@ void cinc__target(uint32_t worker);
 // a runtime the task runs inline, so code that spawns still works, one task after the other.
 #define CINC_SPAWN(call) cinc__go_##call
 #define CINC_SPAWN_ON(worker, call) (cinc__target(worker), cinc__go_##call)
+// detached into a group: the task outlives the block, and the group waits for it or cancels it. the accept loop
+// of a server spawns each connection this way, so nothing piles up in its frame arena.
+#define CINC_SPAWN_IN(group, call) (cinc__detach(group), cinc__go_##call)
+#define CINC_SPAWN_IN_ON(group, worker, call) (cinc__detach(group), cinc__target(worker), cinc__go_##call)
 
 // for declaring futures, `CINC_FUTURE(price_of) prices[3];`. a single one is simpler with `auto`.
 #define CINC_FUTURE(fn) fn##__future
 
-// waits for the task and gives its result, zeroed when it was cancelled. cinc_join(future.task) tells which.
-// awaiting a void function is a void expression.
+// waits for the task and gives its result, zeroed when it was cancelled or when the wait itself timed out or
+// was cancelled. cinc_join(future.task) tells which. awaiting a void function is a void expression.
 cinc_error cinc_join(cinc_task *task);
+
+// every future has this layout. `future` is copied into a one element array so it is evaluated once, which makes
+// await(spawn(f(x))) work. a detached future has no task: awaiting one is a bug and aborts, cinc_join gives
+// CINC_ERROR_CLOSED.
+typedef struct cinc__future {
+  cinc_task *task;
+  void *result;
+} cinc__future;
+[[noreturn]] void cinc__await_detached(void);
+static inline cinc_error cinc__await_task(cinc_task *task) {
+  if (!task) cinc__await_detached();
+  return cinc_join(task);
+}
+static inline void *cinc__await(const void *future, void *zero) {
+  cinc__future f;
+  memcpy(&f, future, sizeof f);
+  return cinc__await_task(f.task) == CINC_OK ? f.result : zero;
+}
 #define CINC_AWAIT(future)                                                                                       \
   _Generic((future).result,                                                                                      \
-      cinc_unit *: (void)cinc_join((future).task),                                                               \
-      default: (cinc_join((future).task), *(future).result))
+      cinc_unit *: (void)cinc__await_task((future).task),                                                        \
+      default: *(typeof((future).result))cinc__await((typeof(future)[1]){future}, &(typeof(*(future).result)){}))
 
+// cancels the task and, through it, every task it spawned in its blocks. it is seen at the task's next wait or
+// cinc_check.
 void cinc_cancel(cinc_task *task);
 #define CINC_CANCEL(future) cinc_cancel((future).task)
 // for loops that never wait: CINC_ERROR_CANCELLED or CINC_ERROR_TIMEOUT once the task should stop.
@@ -193,6 +236,23 @@ void cinc__block_leave(cinc__scope *s);
 #define CINC_CONCURRENTLY                                                                                        \
   for (cinc__scope CINC__UNIQUE(cinc__c) [[gnu::cleanup(cinc__block_leave)]] = cinc__block_enter();              \
        CINC__UNIQUE(cinc__c).once; cinc__block_end(&CINC__UNIQUE(cinc__c)))
+
+/* groups: Go's WaitGroup for detached tasks, zero initialized is empty. a group outlives its tasks. */
+
+struct cinc_group {
+  // live tasks in the low 48 bits, queued waiters above.
+  _Atomic(uint64_t) state;
+  _Atomic(uint32_t) lock;
+  _Atomic(bool) cancelled;
+  void *waiters;
+  _Atomic(void *) runtime;
+};
+
+// waits until the group is empty. honors the current deadline and cancellation.
+cinc_error cinc_group_wait(cinc_group *group);
+// cancels the group's tasks, and the ones spawned into it later.
+void cinc_group_cancel(cinc_group *group);
+uint64_t cinc_group_live(const cinc_group *group);
 
 /* ========================================================================================================== */
 /* deadlines and the blocking pool.                                                                           */
@@ -222,7 +282,11 @@ void cinc__blocking_leave(cinc__scope *s);
   for (cinc__scope CINC__UNIQUE(cinc__b) [[gnu::cleanup(cinc__blocking_leave)]] = cinc__blocking_enter();        \
        CINC__UNIQUE(cinc__b).once; CINC__UNIQUE(cinc__b).once = false)
 
-// the same as a function, for callbacks.
+// the same as a function, for callbacks and for libraries with deep stacks: `fn` runs on the pool thread's own
+// stack. it is skipped when the task is already cancelled or past its deadline, which is then returned.
+//
+// a CINC_BLOCKING block runs on the task's stack, moved to a pool thread and back. thread locals are not the
+// same on both sides of its edges, so code keeps no pointer to one, errno included, across them.
 cinc_error cinc_blocking(void (*fn)(void *arg), void *arg);
 
 /* ========================================================================================================== */
@@ -236,15 +300,44 @@ typedef enum cinc_io : uint8_t {
 
 // the building block for libraries with their own protocol code: wait, then call read or write as usual.
 cinc_error cinc_wait_fd(int fd, cinc_io events);
-// reads what is available, at most `len`. zero bytes means the peer closed.
+// reads what is available, at most `len`. zero bytes and CINC_ERROR_CLOSED mean the peer closed.
 cinc_error cinc_read(int fd, void *buf, size_t len, size_t *got);
+// reads exactly `len` bytes, CINC_ERROR_CLOSED when the peer closes first. `got` may be null.
+cinc_error cinc_read_exact(int fd, void *buf, size_t len, size_t *got);
 cinc_error cinc_write_all(int fd, const void *buf, size_t len);
-// resolves `host` on the blocking pool, then connects without blocking the worker.
+// writes every buffer in order with as few system calls as possible, for headers and a body.
+struct iovec;
+cinc_error cinc_writev_all(int fd, const struct iovec *iov, int count);
+// resolves `host` on the blocking pool, then connects without blocking the worker. the socket is non blocking,
+// with TCP_NODELAY and without SIGPIPE.
 cinc_error cinc_connect(const char *host, uint16_t port, int *fd);
-// `bind` is "host:port". with `reuse_port` every worker can listen on the same address, which ciesta does.
+// `bind` is "host:port", "[::]:port" or ":port". an empty host or [::] listens on IPv6 and IPv4 at once, a
+// name tries its IPv4 addresses first. with `reuse_port` several sockets can listen on the same address.
 cinc_error cinc_listen(const char *bind, bool reuse_port, int *fd);
+// the port a socket is bound to, for listening on port 0.
+uint16_t cinc_local_port(int fd);
+// the accepted socket is non blocking, with TCP_NODELAY and without SIGPIPE.
 cinc_error cinc_accept(int listener, int *fd);
+// wakes the tasks of this worker waiting on `fd`, then closes it.
 void cinc_close(int fd);
+
+// whether the kernel spreads connections over sockets listening with `reuse_port`. Linux does: a server listens
+// once per worker and accepts on each. macOS hands every connection to one socket: a server listens once,
+// accepts on one task and spawns each connection with CINC_SPAWN_IN_ON, round robin over the workers.
+#if defined(__linux__)
+#define CINC_REUSEPORT_BALANCES 1
+#else
+#define CINC_REUSEPORT_BALANCES 0
+#endif
+
+/* ========================================================================================================== */
+/* shutdown.                                                                                                  */
+/* ========================================================================================================== */
+
+// waits for SIGINT or SIGTERM and gives which one in `signo`, which may be null. the first call installs the
+// handlers, and once a signal came every call returns right away, in every task. a second signal ends the
+// process the default way, so a stuck shutdown can still be interrupted.
+cinc_error cinc_wait_shutdown(int *signo);
 
 /* ========================================================================================================== */
 /* channels.                                                                                                  */

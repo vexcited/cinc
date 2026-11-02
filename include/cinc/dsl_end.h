@@ -1,6 +1,8 @@
 #undef spawnable
 #undef spawn
 #undef spawn_on
+#undef spawn_in
+#undef spawn_in_on
 #undef await
 #undef cancel
 #undef future

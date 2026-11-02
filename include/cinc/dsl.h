@@ -6,6 +6,8 @@
 #define spawnable CINC_SPAWNABLE
 #define spawn CINC_SPAWN
 #define spawn_on CINC_SPAWN_ON
+#define spawn_in CINC_SPAWN_IN
+#define spawn_in_on CINC_SPAWN_IN_ON
 #define await CINC_AWAIT
 #define cancel CINC_CANCEL
 #define future CINC_FUTURE
