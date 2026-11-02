@@ -49,7 +49,7 @@ static uint64_t ping_pong(uint32_t ping_on, uint32_t pong_on, uint64_t n) {
   uint64_t t0 = now_ns();
   concurrently {
     spawn_on(pong_on, pong(a, b));
-    await(spawn_on(ping_on, ping(a, b, n)));
+    (void)await(spawn_on(ping_on, ping(a, b, n)));
     chan_close(a);
   }
   uint64_t took = now_ns() - t0;
