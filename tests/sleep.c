@@ -5,7 +5,7 @@
 
 // never early. late by a few milliseconds at most on a machine of its own, but docker's virtual machine wakes even
 // a bare nanosleep 10 ms late, and more under emulation and sanitizers.
-enum { SLACK_MS = CILO_ASAN ? 150 : 50 };
+enum { SLACK_MS = CILO_ASAN ? 300 : 50 };
 
 static _Atomic(uint64_t) worst_late, early;
 

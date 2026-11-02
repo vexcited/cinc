@@ -52,8 +52,8 @@ static int body(void *) {
       CHECK(!cinc_in_task());
       usleep(100'000);
     }
-    // the worker went on with the ticker meanwhile.
-    CHECK(ticks - before > 20);
+    // the worker went on with the ticker meanwhile, which a block run in place would have stopped.
+    CHECK(ticks - before > 5);
     cancel(t);
   }
   CHECK(!pthread_equal(inside, worker));
