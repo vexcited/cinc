@@ -1,7 +1,11 @@
 #include <cinc/cinc.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 
 // a pretend key value store, answering `GET key\r\n` with one line.
+#define KV_PORT 7379
+
 typedef struct kv {
   int fd;
 } kv;
@@ -32,7 +36,7 @@ static void kv_close(kv *c) {
 static int blocking_main(void) {
   kv c;
   char value[128];
-  if (kv_open(&c, "127.0.0.1", 7000))
+  if (kv_open(&c, "127.0.0.1", KV_PORT))
     return 1;
   cinc_error e = kv_get(&c, "motd", value, sizeof value);
   if (!e)
@@ -48,7 +52,7 @@ static int blocking_main(void) {
 static cinc_error lookup(const char *key) {
   kv c;
   char value[128];
-  cinc_error e = kv_open(&c, "127.0.0.1", 7000);
+  cinc_error e = kv_open(&c, "127.0.0.1", KV_PORT);
   if (e)
     return e;
   e = kv_get(&c, key, value, sizeof value);
@@ -73,6 +77,33 @@ static int async_main(void *) {
   return 0;
 }
 
-int main(int argc, char **) {
-  return argc > 1 ? CINC_RUN(async_main, nullptr) : blocking_main();
+/* ========================================================================================================== */
+/* the server is a plain thread too, so this program needs nothing else running.                              */
+/* ========================================================================================================== */
+
+static void *kv_serve(void *arg) {
+  int listener = *(int *)arg, fd;
+  while (cinc_accept(listener, &fd) == CINC_OK) {
+    char line[256], reply[300];
+    size_t got;
+    // a request fits in one read here, a real server would buffer.
+    if (cinc_read(fd, line, sizeof line - 1, &got) == CINC_OK) {
+      line[got] = 0;
+      line[strcspn(line, "\r\n")] = 0;
+      int n = snprintf(reply, sizeof reply, "value of %s", line + 4);
+      cinc_write_all(fd, reply, (size_t)n);
+    }
+    cinc_close(fd);
+  }
+  return nullptr;
+}
+
+int main(void) {
+  int listener;
+  if (cinc_listen("127.0.0.1:7379", false, &listener))
+    return 1;
+  pthread_t server;
+  pthread_create(&server, nullptr, kv_serve, &listener);
+  // the same client, called from a plain main and then from tasks.
+  return blocking_main() || CINC_RUN(async_main, nullptr);
 }
