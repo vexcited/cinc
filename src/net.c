@@ -202,8 +202,9 @@ static cinc_error resolve(const char *host, size_t host_len, uint16_t port, bool
   r->hints.ai_flags |= AI_NUMERICHOST;
   r->rc = getaddrinfo(r->host[0] ? r->host : nullptr, r->port, &r->hints, &r->res);
   if (r->rc == EAI_NONAME && r->host[0]) {
+    // no AI_ADDRCONFIG: it hides localhost in a container that only has loopback. an IPv6 address on a host
+    // without IPv6 just fails to connect, and the next one is tried.
     r->hints.ai_flags &= ~AI_NUMERICHOST;
-    r->hints.ai_flags |= AI_ADDRCONFIG;
     cinc__thread *th = cinc__self();
     if (cinc__in_worker(th)) {
       r->job = (cinc__job){.fn = resolve_run, .arg = r, .abandon = resolve_abandon};
