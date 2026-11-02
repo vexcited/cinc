@@ -62,6 +62,17 @@ A spawn outside any `concurrently` block is detached, like `go f(x)`: it runs un
 for it, but there is nothing to await. `spawn_in(&group, f(x))` detaches into a group that can be waited for or
 cancelled, which is what an accept loop wants.
 
+A detached task frees itself when it returns, so its future holds no task and `cancel` cannot reach it. The group is its handle, like a Go context: one that should be cancelled on its own gets a group of its own, kept in whatever owns the task, and the owner cancels and waits for that group before it goes away.
+
+```c
+typedef struct room { cinc_group timers; ... } room;
+
+spawn_in(&r->timers, presence_timer(r));
+...
+cinc_group_cancel(&r->timers);                         // when the room closes
+cinc_group_wait(&r->timers);
+```
+
 ## Select, semaphores and conditions
 
 ```c
