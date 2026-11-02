@@ -1,0 +1,6 @@
+-std=c23
+-Iinclude
+-I../ciko-cilo/include
+-Wall
+-Wextra
+-Wpedantic
