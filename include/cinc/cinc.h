@@ -133,9 +133,9 @@ cinc_error cinc_yield(void);
 /*   double p = CINC_AWAIT(price);                                                                            */
 /*                                                                                                            */
 /* CINC_SPAWNABLE leaves the function alone, so it works on functions from other libraries too. it takes up   */
-/* to 8 parameters, and a void function gives a future of cinc_unit.                                         */
+/* to 8 parameters, and a void function gives a future of cinc_unit.                                          */
 /*                                                                                                            */
-/* a spawn inside a CINC_CONCURRENTLY block belongs to the block. outside of one, or with CINC_SPAWN_IN, it    */
+/* a spawn inside a CINC_CONCURRENTLY block belongs to the block. outside of one, or with CINC_SPAWN_IN, it   */
 /* is detached: it runs on its own until it returns, cinc_run waits for it, and its future has no task.       */
 /* ========================================================================================================== */
 
@@ -237,7 +237,7 @@ void cinc__block_leave(cinc__scope *s);
   for (cinc__scope CINC__UNIQUE(cinc__c) [[gnu::cleanup(cinc__block_leave)]] = cinc__block_enter();              \
        CINC__UNIQUE(cinc__c).once; cinc__block_end(&CINC__UNIQUE(cinc__c)))
 
-/* groups: Go's WaitGroup for detached tasks, zero initialized is empty. a group outlives its tasks. */
+/* groups: Go's WaitGroup for detached tasks, zero initialized is empty. a group outlives its tasks.          */
 
 struct cinc_group {
   // live tasks in the low 48 bits, queued waiters above.
@@ -285,8 +285,10 @@ void cinc__blocking_leave(cinc__scope *s);
 // the same as a function, for callbacks and for libraries with deep stacks: `fn` runs on the pool thread's own
 // stack. it is skipped when the task is already cancelled or past its deadline, which is then returned.
 //
-// a CINC_BLOCKING block runs on the task's stack, moved to a pool thread and back. thread locals are not the
-// same on both sides of its edges, so code keeps no pointer to one, errno included, across them.
+// a CINC_BLOCKING block runs on the task's stack, moved to a pool thread and back. thread locals differ on both
+// sides of its edges, and compilers merge calls to functions declared const, like pthread_self and glibc's
+// errno, across them. code that reads one inside the block does it in a function the block calls, or uses
+// cinc_blocking.
 cinc_error cinc_blocking(void (*fn)(void *arg), void *arg);
 
 /* ========================================================================================================== */

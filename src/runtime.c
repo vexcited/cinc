@@ -141,22 +141,25 @@ static cinc__thread *suspend(cinc__thread *th, cinc__fiber *f, uint32_t action) 
 static size_t round_up(size_t n, size_t to) { return (n + to - 1) & ~(to - 1); }
 
 static void fiber_frame(cinc__fiber *f) {
-  // the stack ends where the header starts, page aligned.
+  // the stack ends where the header starts, page aligned. function pointers go in through memcpy, iso c has no
+  // cast between them and data pointers.
   void **top = (void **)f;
+  void (*entry)(cinc__fiber *, cinc__thread *) = fiber_main;
+  void (*start)(void) = cinc__trampoline;
 #if defined(__aarch64__)
   void **sp = top - 20;
   memset(sp, 0, 20 * sizeof(void *));
-  sp[0] = (void *)fiber_main;
+  memcpy(&sp[0], &entry, sizeof entry);
   sp[1] = f;
-  sp[11] = (void *)cinc__trampoline;
+  memcpy(&sp[11], &start, sizeof start);
 #elif defined(__x86_64__)
   void **sp = top - 10;
   memset(sp, 0, 10 * sizeof(void *));
   uint32_t csr[2] = {0x1f80, 0x037f};
   memcpy(sp, csr, sizeof csr);
   sp[4] = f;
-  sp[5] = (void *)fiber_main;
-  sp[7] = (void *)cinc__trampoline;
+  memcpy(&sp[5], &entry, sizeof entry);
+  memcpy(&sp[7], &start, sizeof start);
 #else
 #error "cinc switches stacks on aarch64 and x86_64 only"
 #endif
