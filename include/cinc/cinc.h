@@ -148,6 +148,7 @@ typedef struct cinc_unit {
 // zeroed memory from the current task's frame arena, kept apart from cinc_arena() and rewound when the
 // innermost CINC_CONCURRENTLY block ends. a spawn costs a pointer bump, no malloc. a detached frame lives as long
 // as its task.
+[[nodiscard, gnu::returns_nonnull, gnu::alloc_size(1), gnu::alloc_align(2)]]
 void *cinc__frame(size_t size, size_t align);
 cinc_task *cinc__start(void (*entry)(void *frame), void *frame);
 // the next spawn of the current task lands on `worker` instead of the current one.
@@ -206,7 +207,7 @@ typedef struct cinc__future {
   cinc_task *task;
   void *result;
 } cinc__future;
-[[noreturn]] void cinc__await_detached(void);
+[[noreturn, gnu::cold]] void cinc__await_detached(void);
 static inline cinc_error cinc__await_task(cinc_task *task) {
   if (!task) cinc__await_detached();
   return cinc_join(task);
@@ -354,7 +355,7 @@ typedef struct cinc_chan cinc_chan;
 // zero capacity is a rendezvous, the sender waits for a receiver. a channel works across workers. a send or a
 // receive that can go on without waiting does, even in a task that is cancelled or past its deadline, so a
 // permit or a bell is still handed back from one. only a wait gives CINC_ERROR_CANCELLED or CINC_ERROR_TIMEOUT.
-cinc_chan *cinc_chan_new_(size_t elem_size, size_t elem_align, size_t capacity);
+[[nodiscard, gnu::returns_nonnull]] cinc_chan *cinc_chan_new_(size_t elem_size, size_t elem_align, size_t capacity);
 cinc_error cinc_chan_send_(cinc_chan *ch, const void *value);
 cinc_error cinc_chan_recv_(cinc_chan *ch, void *out);
 // senders get CINC_ERROR_CLOSED right away, receivers once the buffer is drained.
@@ -465,7 +466,7 @@ typedef struct cinc_sem {
 // takes a permit right away when one is left, even in a task that is cancelled or past its deadline. only a
 // wait is interrupted.
 cinc_error cinc_sem_acquire(cinc_sem *s);
-bool cinc_sem_try_acquire(cinc_sem *s);
+[[nodiscard]] bool cinc_sem_try_acquire(cinc_sem *s);
 // never waits and never fails, so a cancelled task gives its permit back too.
 void cinc_sem_release(cinc_sem *s);
 // zero while the permits are below zero.
