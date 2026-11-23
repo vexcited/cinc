@@ -1,4 +1,5 @@
--std=c23
+-std=c2y
+-fdefer-ts
 -Iinclude
 -I../ciko-cilo/include
 -Wall
