@@ -6,7 +6,7 @@ if(APPLE AND NOT CMAKE_C_COMPILER AND NOT DEFINED ENV{CC})
     PATHS /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin NO_DEFAULT_PATH)
 endif()
 
-project(cinc VERSION 0.1.0 LANGUAGES C ASM)
+project(cinc VERSION 0.0.0 LANGUAGES C ASM)
 
 # cmake knows no standard past C23, so the flags are given by hand.
 set(CINC_C2Y -std=c2y -fdefer-ts)
