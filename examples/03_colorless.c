@@ -1,5 +1,6 @@
 #include <cinc/cinc.h>
 #include <pthread.h>
+#include <stdcountof.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -68,7 +69,7 @@ static int async_main(void *) {
 
   CINC_WITHIN(500) {
     CINC_CONCURRENTLY {
-      for (size_t i = 0; i < sizeof keys / sizeof *keys; i++)
+      for (size_t i = 0; i < countof(keys); i++)
         CINC_SPAWN(lookup(keys[i]));
     }
   } else {

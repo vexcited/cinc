@@ -1,5 +1,6 @@
 #include <cilo/dsl.h>
 #include <cinc/dsl.h>
+#include <stdcountof.h>
 #include <stdio.h>
 
 typedef struct Job {
@@ -56,7 +57,7 @@ CINC_MAIN(.workers = 4) {
   concurrently {
     for (uint32_t w = 0; w < cinc_workers(); w++)
       spawn_on(w, consume(jobs, &stats));
-    for (uint32_t i = 0; i < sizeof paths / sizeof *paths; i++)
+    for (uint32_t i = 0; i < countof(paths); i++)
       if (chan_send(jobs, (Job){.id = i, .path = paths[i]}))
         break;
     // the consumers drain what is left and return, which ends the block.

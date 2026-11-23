@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <stdcountof.h>
+#include <stddefer.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -20,7 +22,7 @@
 /* ========================================================================================================== */
 
 static cinc__fdent *fd_entry(cinc__worker *w, int fd) {
-  if ((uint32_t)fd >= w->nfds) {
+  if (CILO_UNLIKELY((uint32_t)fd >= w->nfds)) {
     uint32_t n = w->nfds ? w->nfds : 64;
     while (n <= (uint32_t)fd) n *= 2;
     w->fds = cilo_mrealloc(w->fds, n * sizeof *w->fds);
@@ -42,10 +44,10 @@ static uint8_t fd_wanted(const cinc__fdent *e) {
 static void process(cinc__worker *w, const struct kevent *evs, int n);
 
 static void change(cinc__worker *w, int fd, int16_t filter) {
-  if (w->nchanges == (int)(sizeof w->changes / sizeof *w->changes)) {
+  if (CILO_UNLIKELY(w->nchanges == (int)countof(w->changes))) {
     struct kevent evs[256];
     struct timespec zero = {};
-    int got = kevent(w->pfd, w->changes, w->nchanges, evs, 256, &zero);
+    int got = kevent(w->pfd, w->changes, w->nchanges, evs, (int)countof(evs), &zero);
     w->nchanges = 0;
     if (got > 0) process(w, evs, got);
   }
@@ -132,7 +134,7 @@ void cinc__poller_wait(cinc__worker *w, uint64_t timeout_ns) {
   struct kevent evs[256];
   struct timespec ts = {.tv_sec = (time_t)(timeout_ns / 1'000'000'000u),
                         .tv_nsec = (long)(timeout_ns % 1'000'000'000u)};
-  int n = kevent(w->pfd, w->changes, w->nchanges, evs, 256, timeout_ns == CINC__NEVER ? nullptr : &ts);
+  int n = kevent(w->pfd, w->changes, w->nchanges, evs, (int)countof(evs), timeout_ns == CINC__NEVER ? nullptr : &ts);
   int lost = n < 0 && errno != EINTR && w->nchanges;
   w->nchanges = 0;
   if (n > 0) process(w, evs, n);
@@ -164,7 +166,7 @@ void cinc__poller_wait(cinc__worker *w, uint64_t timeout_ns) {
   int ms = -1;
   if (timeout_ns != CINC__NEVER)
     ms = timeout_ns >= (uint64_t)INT32_MAX * 1'000'000u ? INT32_MAX : (int)((timeout_ns + 999'999u) / 1'000'000u);
-  int n = epoll_wait(w->pfd, evs, 256, ms);
+  int n = epoll_wait(w->pfd, evs, (int)countof(evs), ms);
   for (int i = 0; i < n; i++) {
     int fd = evs[i].data.fd;
     uint32_t e = evs[i].events;
@@ -194,27 +196,27 @@ static cinc_error wait_worker(cinc__thread *th, cinc_task *t, int fd, uint8_t wa
   if (e->waiters) e->waiters->prev = &n;
   e->waiters = &n;
   w->io_waiters++;
+  defer {
+    // the table may have moved while parked.
+    cinc__fdent *entry = &w->fds[fd];
+    if (n.prev) n.prev->next = n.next;
+    else entry->waiters = n.next;
+    if (n.next) n.next->prev = n.prev;
+    w->io_waiters--;
+  }
   // kqueue filters are separate, epoll registers the union of every waiter on the fd.
   int err = arm(w, fd, e, before | want, CINC__KQUEUE ? want : (uint8_t)(before | want));
-  cinc_error result = CINC_OK;
   if (err) {
     // regular files cannot be polled and are always ready.
-    result = err == EPERM ? CINC_OK : CINC_ERROR_IO;
     errno = err;
-  } else {
-    for (;;) {
-      cinc__park(th, t, t->deadline);
-      if (n.got) break;
-      if ((result = cinc__interrupted(t))) break;
-    }
+    return err == EPERM ? CINC_OK : CINC_ERROR_IO;
   }
-  // the table may have moved while parked.
-  e = &w->fds[fd];
-  if (n.prev) n.prev->next = n.next;
-  else e->waiters = n.next;
-  if (n.next) n.next->prev = n.prev;
-  w->io_waiters--;
-  return n.got ? CINC_OK : result;
+  for (;;) {
+    cinc__park(th, t, t->deadline);
+    if (n.got) return CINC_OK;
+    cinc_error result = cinc__interrupted(t);
+    if (result) return result;
+  }
 }
 
 static cinc_error wait_thread(cinc__thread *th, cinc_task *t, int fd, uint8_t want) {

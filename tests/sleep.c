@@ -1,5 +1,6 @@
 #include "check.h"
 
+#include <stdcountof.h>
 #include <stdlib.h>
 #include <time.h>
 
@@ -32,7 +33,7 @@ static int body(void *) {
   // the first round runs every path once, which emulators translate on the way.
   sleeper(1);
   worst_late = 0;
-  for (size_t i = 0; i < sizeof lengths / sizeof *lengths; i++) sleeper(lengths[i]);
+  for (size_t i = 0; i < countof(lengths); i++) sleeper(lengths[i]);
   CHECK(early == 0);
   CHECK(worst_late < SLACK_MS * 1'000'000u);
 

@@ -1,5 +1,6 @@
 #include "internal.h"
 
+#include <stdcountof.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,7 @@ struct cinc_chan {
 
 cinc_chan *cinc_chan_new_(size_t elem_size, size_t elem_align, size_t capacity) {
   size_t align = elem_align > alignof(cinc_chan) ? elem_align : alignof(cinc_chan);
-  size_t offset = (sizeof(cinc_chan) + align - 1) & ~(align - 1), ring, size;
+  size_t offset = cinc__round_up(sizeof(cinc_chan), align), ring, size;
   if (ckd_mul(&ring, elem_size, capacity) || ckd_add(&size, offset, ring)) cilo_oom(SIZE_MAX);
   cinc_chan *ch = align <= 16 ? cilo_malloc(size) : cilo_memalign(align, size);
   *ch = (cinc_chan){.elem = elem_size, .cap = capacity, .ring = (unsigned char *)ch + offset};
@@ -163,8 +164,9 @@ void cinc_chan_close_(cinc_chan *ch) {
   if (!ch->closed) {
     ch->closed = true;
     // what is buffered stays for the receivers, only the waiters are let go.
-    for (void **q = &ch->senders; q; q = q == &ch->senders ? &ch->receivers : nullptr)
-      for (cinc__waiter *w; (w = take(q));) {
+    void **queues[] = {&ch->senders, &ch->receivers};
+    for (size_t i = 0; i < countof(queues); i++)
+      for (cinc__waiter *w; (w = take(queues[i]));) {
         claim(w, CINC_ERROR_CLOSED);
         w->next = woken;
         woken = w;
@@ -182,7 +184,7 @@ enum { SELECT_MAX = 16 };
 
 static uint32_t select_random(void) {
   static thread_local uint32_t x;
-  if (!x) x = (uint32_t)cinc__now_ns() | 1;
+  if (CILO_UNLIKELY(!x)) x = (uint32_t)cinc__now_ns() | 1;
   x ^= x << 13;
   x ^= x >> 17;
   x ^= x << 5;
@@ -211,7 +213,7 @@ static int select_ready(const cinc_case *cases, size_t count, cinc_error *result
 }
 
 int cinc_select_(const cinc_case *cases, size_t count, bool wait, cinc_error *error) {
-  if (count > SELECT_MAX) {
+  if (CILO_UNLIKELY(count > SELECT_MAX)) {
     fprintf(stderr, "cinc: a select takes at most %d cases, it got %zu\n", SELECT_MAX, count);
     abort();
   }

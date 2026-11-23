@@ -319,18 +319,19 @@ typedef struct cinc__local {
 /* shared between the sources.                                                                                */
 /* ========================================================================================================== */
 
-cinc__thread *cinc__self(void);
-cinc_task *cinc__plain(cinc__thread *th);
-static inline cinc_task *cinc__cur(cinc__thread *th) { return th->current ? th->current : cinc__plain(th); }
+[[gnu::returns_nonnull]] cinc__thread *cinc__self(void);
+[[gnu::returns_nonnull]] cinc_task *cinc__plain(cinc__thread *th);
+[[gnu::returns_nonnull]] static inline cinc_task *cinc__cur(cinc__thread *th) {
+  return th->current ? th->current : cinc__plain(th);
+}
 static inline bool cinc__in_worker(const cinc__thread *th) { return th->mode == CINC__WORKER && th->current; }
 
+[[gnu::const]] static inline size_t cinc__round_up(size_t n, size_t to) { return (n + to - 1) & ~(to - 1); }
+
 uint64_t cinc__now_ns(void);
-uint64_t cinc__after_ms(uint64_t now, uint64_t ms);
-cinc_error cinc__interrupted(cinc_task *t);
+[[nodiscard]] cinc_error cinc__interrupted(cinc_task *t);
 void cinc__park(cinc__thread *th, cinc_task *t, uint64_t until);
 void cinc__unpark(cinc_task *t);
-void cinc__notify(cinc__worker *w);
-void cinc__runq_push(cinc__worker *w, cinc_task *t);
 
 // heads are void pointers, which is what the public structs can hold.
 void cinc__wq_push(void **head, cinc__waiter *w);
@@ -341,12 +342,10 @@ void cinc__wq_release(cinc__waiter *w);
 cinc_error cinc__wq_wait(cinc__thread *th, cinc_task *t, cinc__waiter *w, _Atomic(uint32_t) *word, uint32_t bit,
                          void **head, bool interruptible);
 
-void cinc__pool_push(cinc__runtime *rt, cinc__job *job);
-void cinc__pool_stop(cinc__runtime *rt);
 // runs the job on the pool and waits for it. an abandonable job may be left behind on interruption.
-cinc_error cinc__offload(cinc__thread *th, cinc_task *t, cinc__job *job, bool interruptible);
+[[nodiscard]] cinc_error cinc__offload(cinc__thread *th, cinc_task *t, cinc__job *job, bool interruptible);
 
-bool cinc__poller_init(cinc__worker *w);
+[[nodiscard]] bool cinc__poller_init(cinc__worker *w);
 void cinc__poller_close(cinc__worker *w);
 void cinc__poller_wait(cinc__worker *w, uint64_t timeout_ns);
 

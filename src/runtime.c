@@ -4,6 +4,8 @@
 #include "internal.h"
 
 #include <errno.h>
+#include <stdcountof.h>
+#include <stddefer.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,7 +36,7 @@ uint64_t cinc__now_ns(void) {
   return (uint64_t)ts.tv_sec * 1'000'000'000u + (uint64_t)ts.tv_nsec;
 }
 
-uint64_t cinc__after_ms(uint64_t now, uint64_t ms) {
+[[gnu::const]] static uint64_t after_ms(uint64_t now, uint64_t ms) {
   uint64_t ns, at;
   if (ckd_mul(&ns, ms, 1'000'000u) || ckd_add(&at, now, ns)) return CINC__NEVER;
   return at;
@@ -139,8 +141,6 @@ static cinc__thread *suspend(cinc__thread *th, cinc__fiber *f, uint32_t action) 
 /* stacks.                                                                                                    */
 /* ========================================================================================================== */
 
-static size_t round_up(size_t n, size_t to) { return (n + to - 1) & ~(to - 1); }
-
 static void fiber_frame(cinc__fiber *f) {
   // the stack ends where the header starts, page aligned. function pointers go in through memcpy, iso c has no
   // cast between them and data pointers.
@@ -167,8 +167,8 @@ static void fiber_frame(cinc__fiber *f) {
   f->sp = sp;
 }
 
-static cinc__fiber *fiber_new(cinc__runtime *rt) {
-  size_t page = rt->page, header = round_up(sizeof(cinc__fiber) + (8 << 10), page);
+[[nodiscard, gnu::cold, gnu::returns_nonnull]] static cinc__fiber *fiber_new(cinc__runtime *rt) {
+  size_t page = rt->page, header = cinc__round_up(sizeof(cinc__fiber) + (8 << 10), page);
   size_t size = page + rt->stack_size + header;
   int flags = MAP_PRIVATE | MAP_ANON;
 #if defined(MAP_STACK)
@@ -180,7 +180,7 @@ static cinc__fiber *fiber_new(cinc__runtime *rt) {
   cinc__fiber *f = (cinc__fiber *)(m + page + rt->stack_size);
   *f = (cinc__fiber){.map = m, .map_size = size, .stack = m + page, .stack_size = rt->stack_size};
   // the rest of the header page is lent to the arenas, so small tasks map no chunk at all.
-  char *lend = (char *)round_up((uintptr_t)(f + 1), 64), *end = m + size;
+  char *lend = (char *)cinc__round_up((uintptr_t)(f + 1), 64), *end = m + size;
   size_t half = (size_t)(end - lend) / 2 & ~(size_t)63;
   f->frames = cilo_arena_on(lend, half, false);
   f->arena = cilo_arena_on(lend + half, (size_t)(end - lend) - half, false);
@@ -192,11 +192,11 @@ static cinc__fiber *fiber_new(cinc__runtime *rt) {
 static void fiber_free(cinc__fiber *f) {
   cilo_arena_drop(&f->arena);
   cilo_arena_drop(&f->frames);
-  for (int i = 0; i < CILO_SCRATCH_COUNT; i++) cilo_arena_drop(&f->scratch[i]);
+  for (size_t i = 0; i < countof(f->scratch); i++) cilo_arena_drop(&f->scratch[i]);
   munmap(f->map, f->map_size);
 }
 
-static cinc__fiber *fiber_get(cinc__worker *w) {
+[[nodiscard, gnu::returns_nonnull]] static cinc__fiber *fiber_get(cinc__worker *w) {
   cinc__fiber *f = w->fibers;
   if (CILO_LIKELY(f)) {
     w->fibers = f->next;
@@ -220,7 +220,7 @@ static void arena_recycle(cilo_arena *a) {
 static void fiber_put(cinc__worker *w, cinc__fiber *f) {
   arena_recycle(&f->arena);
   arena_recycle(&f->frames);
-  for (int i = 0; i < CILO_SCRATCH_COUNT; i++) arena_recycle(&f->scratch[i]);
+  for (size_t i = 0; i < countof(f->scratch); i++) arena_recycle(&f->scratch[i]);
   f->task = nullptr;
   uint32_t n = atomic_load_explicit(&w->nfibers, memory_order_relaxed);
   if (n >= CINC__POOL_MAX) {
@@ -236,7 +236,7 @@ static void fiber_put(cinc__worker *w, cinc__fiber *f) {
 /* run queue and timers, owned by their worker.                                                               */
 /* ========================================================================================================== */
 
-void cinc__runq_push(cinc__worker *w, cinc_task *t) {
+static void runq_push(cinc__worker *w, cinc_task *t) {
   t->next = nullptr;
   if (w->runq_tail) w->runq_tail->next = t;
   else w->runq_head = t;
@@ -284,7 +284,7 @@ static void timer_down(cinc__worker *w, uint32_t i) {
 }
 
 static void timer_add(cinc__worker *w, cinc_task *t, uint64_t at) {
-  if (w->ntimers == w->timers_cap) {
+  if (CILO_UNLIKELY(w->ntimers == w->timers_cap)) {
     w->timers_cap = w->timers_cap ? w->timers_cap * 2 : 64;
     w->timers = cilo_mrealloc(w->timers, w->timers_cap * sizeof *w->timers);
   }
@@ -319,7 +319,7 @@ static uint64_t timers_fire(cinc__worker *w) {
 /* parking.                                                                                                   */
 /* ========================================================================================================== */
 
-void cinc__notify(cinc__worker *w) {
+static void notify(cinc__worker *w) {
   // a load first, so a busy worker's line is not pulled over for nothing.
   if (!atomic_load_explicit(&w->sleeping, memory_order_seq_cst)) return;
   if (!atomic_exchange_explicit(&w->sleeping, 0, memory_order_seq_cst)) return;
@@ -353,12 +353,12 @@ void cinc__unpark(cinc_task *t) {
   if (s != CINC__PARKED_WORKER) return;
   cinc__worker *w = t->home;
   if (cinc__self()->worker == w) {
-    cinc__runq_push(w, t);
+    runq_push(w, t);
     return;
   }
   t->msg = CINC__MSG_WAKE;
   cinc__mpsc_push(&w->inbox, &t->node);
-  cinc__notify(w);
+  notify(w);
 }
 
 static void park_worker(cinc__thread *th, cinc_task *t, uint64_t until) {
@@ -492,17 +492,17 @@ static void cancel_block(cinc__block *b) {
 }
 
 // a cancelled task passes it on to everything it spawned, from its own thread, where its blocks are safe to walk.
-static void propagate(cinc_task *t) {
+[[gnu::cold]] static void propagate(cinc_task *t) {
   t->propagated = true;
   for (cinc__block *b = t->blocks; b; b = b->outer) cancel_block(b);
 }
 
 cinc_error cinc__interrupted(cinc_task *t) {
-  if (atomic_load_explicit(&t->cancelled, memory_order_relaxed)) {
+  if (CILO_UNLIKELY(atomic_load_explicit(&t->cancelled, memory_order_relaxed))) {
     if (!t->propagated) propagate(t);
     return CINC_ERROR_CANCELLED;
   }
-  if (t->deadline != CINC__NEVER && cinc__now_ns() >= t->deadline) {
+  if (t->deadline != CINC__NEVER && CILO_UNLIKELY(cinc__now_ns() >= t->deadline)) {
     t->fired = true;
     return CINC_ERROR_TIMEOUT;
   }
@@ -526,7 +526,7 @@ uint64_t cinc_remaining_ms(void) {
 
 cinc__scope cinc__deadline_push(uint64_t ms) {
   cinc_task *t = cinc__cur(cinc__self());
-  uint64_t prev = t->deadline, at = cinc__after_ms(cinc__now_ns(), ms);
+  uint64_t prev = t->deadline, at = after_ms(cinc__now_ns(), ms);
   cinc__scope s = {.impl = (void *)(uintptr_t)prev, .once = t->fired};
   t->deadline = at < prev ? at : prev;
   t->fired = false;
@@ -584,7 +584,7 @@ void *cinc__frame(size_t size, size_t align) {
   cinc__thread *th = cinc__self();
   cinc_task *t = cinc__cur(th);
   size_t a = align > alignof(cinc_task) ? align : alignof(cinc_task);
-  size_t offset = round_up(sizeof(cinc_task), align);
+  size_t offset = cinc__round_up(sizeof(cinc_task), align);
   bool detached = th->next_detach || !t->blocks;
   cinc_task *h;
   if (detached && cinc__in_worker(th)) {
@@ -695,11 +695,11 @@ cinc_task *cinc__start(void (*entry)(void *frame), void *frame) {
   bool detached = h->detached;
   if (home == w) {
     if (detached) detached_add(w, h);
-    cinc__runq_push(w, h);
+    runq_push(w, h);
   } else {
     h->msg = CINC__MSG_SPAWN;
     cinc__mpsc_push(&home->inbox, &h->node);
-    cinc__notify(home);
+    notify(home);
   }
   return detached ? nullptr : h;
 }
@@ -766,7 +766,7 @@ static void child_done(cinc_task *c) {
   if (!--b->live && b->waiting) cinc__unpark(b->owner);
 }
 
-void cinc__await_detached(void) {
+[[gnu::cold]] void cinc__await_detached(void) {
   fputs("cinc: await of a detached task. a spawn outside CINC_CONCURRENTLY, or with CINC_SPAWN_IN, gives no "
         "result, spawn it inside a block to await it\n",
         stderr);
@@ -834,7 +834,7 @@ void cinc_group_cancel(cinc_group *g) {
   if (atomic_load_explicit(&g->state, memory_order_seq_cst) & GROUP_LIVE) {
     cinc__runtime *rt = atomic_load_explicit(&g->runtime, memory_order_relaxed);
     atomic_fetch_add_explicit(&rt->epoch, 1, memory_order_seq_cst);
-    for (uint32_t i = 0; i < rt->nworkers; i++) cinc__notify(&rt->workers[i]);
+    for (uint32_t i = 0; i < rt->nworkers; i++) notify(&rt->workers[i]);
   }
   cinc__unlock_bit(&g->lock, 1);
   atomic_fetch_sub_explicit(&g->state, GROUP_WAITER, memory_order_relaxed);
@@ -848,9 +848,12 @@ uint64_t cinc_group_live(const cinc_group *g) {
 /* the scheduler.                                                                                             */
 /* ========================================================================================================== */
 
+static void pool_push(cinc__runtime *rt, cinc__job *j);
+static void pool_stop(cinc__runtime *rt);
+
 static void stop_all(cinc__runtime *rt) {
   atomic_store_explicit(&rt->stop, true, memory_order_seq_cst);
-  for (uint32_t i = 0; i < rt->nworkers; i++) cinc__notify(&rt->workers[i]);
+  for (uint32_t i = 0; i < rt->nworkers; i++) notify(&rt->workers[i]);
 }
 
 static void finish(cinc__worker *w, cinc_task *t) {
@@ -865,7 +868,7 @@ static void finish(cinc__worker *w, cinc_task *t) {
       cinc__worker *owner = t->owner_home;
       t->msg = CINC__MSG_DONE;
       cinc__mpsc_push(&owner->inbox, &t->node);
-      cinc__notify(owner);
+      notify(owner);
     }
     return;
   }
@@ -900,7 +903,7 @@ static void run(cinc__worker *w, cinc__thread *th, cinc_task *t) {
     finish(w, t);
     break;
   case CINC__ACT_BLOCKING:
-    cinc__pool_push(w->rt, &t->job);
+    pool_push(w->rt, &t->job);
     break;
   default:
     break;
@@ -914,10 +917,10 @@ static void drain(cinc__worker *w) {
     switch (t->msg) {
     case CINC__MSG_SPAWN:
       if (t->detached) detached_add(w, t);
-      cinc__runq_push(w, t);
+      runq_push(w, t);
       break;
     case CINC__MSG_WAKE:
-      cinc__runq_push(w, t);
+      runq_push(w, t);
       break;
     case CINC__MSG_DONE:
       child_done(t);
@@ -927,7 +930,7 @@ static void drain(cinc__worker *w) {
 }
 
 // after a group cancel, the detached tasks of this worker that belong to a cancelled group are cancelled.
-static void cancel_groups(cinc__worker *w) {
+[[gnu::cold]] static void cancel_groups(cinc__worker *w) {
   w->epoch = atomic_load_explicit(&w->rt->epoch, memory_order_acquire);
   for (cinc_task *t = w->detached; t; t = t->dnext)
     if (t->group && atomic_load_explicit(&t->group->cancelled, memory_order_acquire)) cinc_cancel(t);
@@ -1027,7 +1030,7 @@ int cinc_run(const cinc_options *options, int (*main)(void *arg), void *arg) {
   rt->page = (size_t)sysconf(_SC_PAGESIZE);
   // asan's frames are several times bigger.
   size_t stack = o.stack_size ? o.stack_size : CILO_ASAN ? 256 << 10 : 64 << 10;
-  rt->stack_size = round_up(stack < (16 << 10) ? 16 << 10 : stack, rt->page);
+  rt->stack_size = cinc__round_up(stack < (16 << 10) ? 16 << 10 : stack, rt->page);
   rt->pool.max = o.blocking_threads ? o.blocking_threads : 64;
   pthread_mutex_init(&rt->pool.lock, nullptr);
   pthread_cond_init(&rt->pool.cond, nullptr);
@@ -1044,7 +1047,7 @@ int cinc_run(const cinc_options *options, int (*main)(void *arg), void *arg) {
   }
 
   int result = 0;
-  size_t offset = round_up(sizeof(cinc_task), alignof(main_frame));
+  size_t offset = cinc__round_up(sizeof(cinc_task), alignof(main_frame));
   cinc_task *t = cilo_calloc(1, offset + sizeof(main_frame));
   main_frame *f = (main_frame *)((char *)t + offset);
   *f = (main_frame){.fn = main, .arg = arg, .result = &result};
@@ -1052,7 +1055,7 @@ int cinc_run(const cinc_options *options, int (*main)(void *arg), void *arg) {
                    .deadline = CINC__NEVER};
   atomic_store_explicit(&rt->roots, 1, memory_order_relaxed);
   detached_add(&rt->workers[0], t);
-  cinc__runq_push(&rt->workers[0], t);
+  runq_push(&rt->workers[0], t);
 
   for (uint32_t i = 1; i < rt->nworkers; i++)
     if (pthread_create(&rt->workers[i].thread, nullptr, worker_thread, &rt->workers[i])) {
@@ -1069,7 +1072,7 @@ int cinc_run(const cinc_options *options, int (*main)(void *arg), void *arg) {
   cilo_scratch_bind(own_scratch);
 
   for (uint32_t i = 1; i < rt->nworkers; i++) pthread_join(rt->workers[i].thread, nullptr);
-  cinc__pool_stop(rt);
+  pool_stop(rt);
   for (uint32_t i = 0; i < rt->nworkers; i++) {
     cinc__worker *w = &rt->workers[i];
     while (w->fibers) {
@@ -1139,7 +1142,7 @@ cinc_error cinc_sleep(uint64_t ms) {
   cinc_task *t = cinc__cur(th);
   cinc_error e = cinc__interrupted(t);
   if (e) return e;
-  uint64_t until = cinc__after_ms(cinc__now_ns(), ms);
+  uint64_t until = after_ms(cinc__now_ns(), ms);
   for (;;) {
     // a sleep that would end past the deadline times out, even when a late wake up saw both pass.
     if (cinc__now_ns() >= until && until <= t->deadline) return CINC_OK;
@@ -1152,7 +1155,7 @@ cinc_error cinc_yield(void) {
   cinc__thread *th = cinc__self();
   if (cinc__in_worker(th)) {
     cinc_task *t = th->current;
-    cinc__runq_push(th->worker, t);
+    runq_push(th->worker, t);
     suspend(th, t->fiber, CINC__ACT_NONE);
     return cinc__interrupted(t);
   }
@@ -1191,7 +1194,7 @@ static void run_job(cinc__thread *th, cinc__job *j) {
     cinc__worker *home = t->home;
     t->msg = CINC__MSG_WAKE;
     cinc__mpsc_push(&home->inbox, &t->node);
-    cinc__notify(home);
+    notify(home);
     return;
   }
   if (t) {
@@ -1208,30 +1211,31 @@ static void run_job(cinc__thread *th, cinc__job *j) {
   job_finish(j);
 }
 
-static void *pool_thread(void *p) {
-  cinc__runtime *rt = p;
-  cinc__pool *pool = &rt->pool;
-  cinc__thread *th = cinc__self();
+// waits for the next job, null once the pool is stopped and drained.
+static cinc__job *pool_take(cinc__pool *pool) {
   pthread_mutex_lock(&pool->lock);
-  for (;;) {
-    while (!pool->head && !pool->stop) {
-      pool->idle++;
-      pthread_cond_wait(&pool->cond, &pool->lock);
-      pool->idle--;
-    }
-    if (!pool->head) break;
-    cinc__job *j = pool->head;
+  defer pthread_mutex_unlock(&pool->lock);
+  while (!pool->head && !pool->stop) {
+    pool->idle++;
+    pthread_cond_wait(&pool->cond, &pool->lock);
+    pool->idle--;
+  }
+  cinc__job *j = pool->head;
+  if (j) {
     pool->head = j->next;
     if (!pool->head) pool->tail = nullptr;
-    pthread_mutex_unlock(&pool->lock);
-    run_job(th, j);
-    pthread_mutex_lock(&pool->lock);
   }
-  pthread_mutex_unlock(&pool->lock);
+  return j;
+}
+
+static void *pool_thread(void *p) {
+  cinc__runtime *rt = p;
+  cinc__thread *th = cinc__self();
+  for (cinc__job *j; (j = pool_take(&rt->pool));) run_job(th, j);
   return nullptr;
 }
 
-void cinc__pool_push(cinc__runtime *rt, cinc__job *j) {
+static void pool_push(cinc__runtime *rt, cinc__job *j) {
   cinc__pool *pool = &rt->pool;
   j->next = nullptr;
   pthread_mutex_lock(&pool->lock);
@@ -1255,7 +1259,7 @@ void cinc__pool_push(cinc__runtime *rt, cinc__job *j) {
   pthread_mutex_unlock(&pool->lock);
 }
 
-void cinc__pool_stop(cinc__runtime *rt) {
+static void pool_stop(cinc__runtime *rt) {
   cinc__pool *pool = &rt->pool;
   pthread_mutex_lock(&pool->lock);
   pool->stop = true;
@@ -1268,7 +1272,7 @@ void cinc__pool_stop(cinc__runtime *rt) {
 cinc_error cinc__offload(cinc__thread *th, cinc_task *t, cinc__job *j, bool interruptible) {
   j->task = t;
   atomic_store_explicit(&j->state, CINC__QUEUED, memory_order_relaxed);
-  cinc__pool_push(th->worker->rt, j);
+  pool_push(th->worker->rt, j);
   for (;;) {
     uint32_t s = atomic_load_explicit(&j->state, memory_order_acquire);
     if (s != CINC__QUEUED) break;

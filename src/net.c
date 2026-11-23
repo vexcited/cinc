@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <stdcountof.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -101,7 +102,7 @@ cinc_error cinc_writev_all(int fd, const struct iovec *iov, int count) {
   bool socket = true;
   while (count > 0) {
     // a window of the caller's buffers, advanced in place as bytes go out.
-    int n = count < 64 ? count : 64;
+    int n = count < (int)countof(local) ? count : (int)countof(local);
     memcpy(local, iov, (size_t)n * sizeof *iov);
     struct iovec *v = local;
     while (n > 0) {
@@ -135,7 +136,7 @@ cinc_error cinc_writev_all(int fd, const struct iovec *iov, int count) {
         v->iov_len -= left;
       }
     }
-    int done = count < 64 ? count : 64;
+    int done = count < (int)countof(local) ? count : (int)countof(local);
     iov += done;
     count -= done;
   }
@@ -157,7 +158,7 @@ static void set_flags(int fd) {
 }
 #endif
 
-static int new_socket(int family) {
+[[nodiscard]] static int new_socket(int family) {
 #if defined(SOCK_NONBLOCK)
   int fd = socket(family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 #else
@@ -194,6 +195,7 @@ static void resolve_abandon(cinc__job *j) {
 
 // numeric hosts are parsed right here. names go to the blocking pool, which the task may give up on when its
 // deadline expires: the job then frees itself.
+[[nodiscard]]
 static cinc_error resolve(const char *host, size_t host_len, uint16_t port, bool passive, struct addrinfo **out) {
   resolving *r = cilo_calloc(1, sizeof *r + host_len + 1);
   memcpy(r->host, host, host_len);
@@ -270,7 +272,7 @@ cinc_error cinc_connect(const char *host, uint16_t port, int *fd) {
   return CINC_OK;
 }
 
-static int listen_on(const struct sockaddr *addr, socklen_t len, bool reuse_port, bool dual) {
+[[nodiscard]] static int listen_on(const struct sockaddr *addr, socklen_t len, bool reuse_port, bool dual) {
   int s = new_socket(addr->sa_family);
   if (s < 0) return -1;
   int one = 1, zero = 0;
@@ -330,11 +332,12 @@ cinc_error cinc_listen(const char *bind, bool reuse_port, int *fd) {
   if (e) return e;
   int err = EADDRNOTAVAIL;
   // IPv4 first: "localhost" then serves 127.0.0.1, which every client tries in the end.
-  for (int family = AF_INET; *fd < 0 && family; family = family == AF_INET ? AF_INET6 : 0)
-    for (struct addrinfo *a = list; a && *fd < 0; a = a->ai_next) {
+  families: for (int family = AF_INET; family; family = family == AF_INET ? AF_INET6 : 0)
+    for (struct addrinfo *a = list; a; a = a->ai_next) {
       if (a->ai_family != family) continue;
       *fd = listen_on(a->ai_addr, a->ai_addrlen, reuse_port, false);
-      if (*fd < 0) err = errno;
+      if (*fd >= 0) break families;
+      err = errno;
     }
   freeaddrinfo(list);
   if (*fd >= 0) return CINC_OK;
@@ -395,7 +398,7 @@ static void on_signal(int signo) {
 
 static void signal_install(void) {
   if (pipe(signal_pipe) < 0) return;
-  for (int i = 0; i < 2; i++) {
+  for (size_t i = 0; i < countof(signal_pipe); i++) {
     fcntl(signal_pipe[i], F_SETFL, fcntl(signal_pipe[i], F_GETFL) | O_NONBLOCK);
     fcntl(signal_pipe[i], F_SETFD, FD_CLOEXEC);
   }
