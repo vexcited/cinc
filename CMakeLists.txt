@@ -20,8 +20,13 @@ if(CINC_SANITIZE)
   add_link_options(-fsanitize=${sanitizers})
 endif()
 
-# a parent project may already provide cilo, otherwise it is fetched.
+# a parent project may already provide cilo, otherwise it is fetched,
+# from a checkout next to this one when there is.
 include(FetchContent)
+get_filename_component(local ${CMAKE_CURRENT_SOURCE_DIR}/../ciko-cilo ABSOLUTE)
+if(NOT FETCHCONTENT_SOURCE_DIR_CILO AND EXISTS ${local}/CMakeLists.txt)
+  set(FETCHCONTENT_SOURCE_DIR_CILO ${local})
+endif()
 if(NOT TARGET cilo::cilo)
   FetchContent_Declare(cilo GIT_REPOSITORY https://code.vexcited.com/ciko/cilo.git GIT_TAG main)
   FetchContent_MakeAvailable(cilo)
