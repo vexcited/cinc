@@ -160,33 +160,29 @@ CINC_MAIN() {
 }
 ```
 
-Linux spreads connections over sockets that listen on the same port with `reuse_port`, so there a server listens
-once per worker and runs one accept loop per worker, each spawning on its own worker with `spawn_in`. macOS hands
-every connection to the same socket, so a server listens once and spreads connections itself as above.
-`CINC_REUSEPORT_BALANCES` tells which, at compile time. `cinc_listen` takes `"0.0.0.0:8080"`, `"[::]:8080"`,
-`":8080"` and names like `"localhost:8080"`. Sockets from `cinc_listen`, `cinc_accept` and `cinc_connect` are non
-blocking, with `TCP_NODELAY` and without `SIGPIPE`.
+Linux spreads connections over sockets that listen on the same port with `reuse_port`, so there a server listens once per worker and runs one accept loop per worker, each spawning on its own worker with `spawn_in`.
+macOS and Windows hand every connection to the same socket, so a server listens once and spreads connections itself as above.
+`CINC_REUSEPORT_BALANCES` tells which, at compile time.
+`cinc_listen` takes `"0.0.0.0:8080"`, `"[::]:8080"`, `":8080"` and names like `"localhost:8080"`.
+Sockets from `cinc_listen`, `cinc_accept` and `cinc_connect` are non blocking, with `TCP_NODELAY` and without `SIGPIPE`.
+On Windows an fd is a winsock `SOCKET` cast to `int`, which keeps it whole, and `(SOCKET)(intptr_t)fd` casts it back.
 
 ## How it works
 
-- **Workers.** One thread and one event loop each, kqueue on macOS and epoll on Linux, with a run queue, a timer heap
-  and a lock free inbox. Other threads wake a worker through `EVFILT_USER` or an eventfd, and only when it sleeps: a
-  worker that just ran something spins for 20 µs first. A task stays on its worker. Worker 0 is the thread that
-  called `cinc_run`.
-- **Switches.** Hand written for aarch64 and x86_64, Mach-O and ELF. They save the callee saved registers, d8 to d15
-  on arm64, mxcsr and the x87 control word on x86_64. The first frame of every task has an undefined return
-  address, so debuggers and backtraces stop there. Under ASan, switches are annotated for its fake stacks.
-- **Stacks.** Mapped with a guard page and kept by the worker that ran the task, up to 1024 per worker.
+- **Workers.** One thread and one event loop each, kqueue on macOS, epoll on Linux and an io completion port on Windows, with a run queue, a timer heap and a lock free inbox. Other threads wake a worker through `EVFILT_USER`, an eventfd or a posted completion, and only when it sleeps: a worker that just ran something spins for 20 µs first. A task stays on its worker. Worker 0 is the thread that called `cinc_run`.
+- **Switches.** Hand written for aarch64 and x86_64, Mach-O, ELF and COFF. They save the callee saved registers, d8 to d15 on arm64, mxcsr and the x87 control word on x86_64, and rdi, rsi and xmm6 to xmm15 on Windows. The first frame of every task has an undefined return address, so debuggers and backtraces stop there. Under ASan, switches are annotated for its fake stacks.
+- **Windows.** Sockets report readiness through `IOCTL_AFD_POLL` on the afd device, as in wepoll, one poll per wait. Sleeps end on a high resolution timer whose expiry the port gets as a packet. The switch carries the TEB's stack bounds with each stack, so exceptions, guard pages and stack probes see the task's stack on any thread, and it has SEH unwind info. The first frame of a task calls the unhandled exception filter, as a Windows fiber does, so crash reporters see crashes in tasks.
+- **Stacks.** Mapped with a guard page and kept by the worker that ran the task, up to 1024 per worker. On Windows the guard page is a `PAGE_GUARD` one, and overflowing it ends the process with `STATUS_STACK_OVERFLOW`.
 - **Blocking.** `blocking { }` moves the task's stack to a pool thread and back, and `cinc_blocking(fn, arg)` runs
   `fn` on the pool thread's own stack, for libraries with deep stacks. Names resolve there too.
-- **Waits.** Channels, selects, mutexes, conditions, semaphores, joins and groups queue their waiters behind a short lock, which a plain thread uses the same way through a condition variable. A select queues one waiter per case and the first waker to claim it wins. A plain thread waits with `poll` and condition variables, and spawns run inline.
+- **Waits.** Channels, selects, mutexes, conditions, semaphores, joins and groups queue their waiters behind a short lock, which a plain thread uses the same way through a condition variable. A select queues one waiter per case and the first waker to claim it wins. A plain thread waits with `poll`, `WSAPoll` on Windows, and condition variables, and spawns run inline.
 
 `blocking { }` moves a stack between threads, and compilers merge calls to functions declared `const`, like glibc's
 `errno` and `pthread_self`, across its edges. Read those in a function the block calls, or use `cinc_blocking`.
 
 ## Building and testing
 
-C23 with clang 19 or later, Apple clang 21, or gcc 14, on macOS and Linux, arm64 and x86_64.
+C23 with clang 19 or later, Apple clang 21, or gcc 14, on macOS and Linux, arm64 and x86_64. On Windows 10 1803 or later, arm64 and x86_64, with MSYS2's clang toolchains, CLANGARM64 and CLANG64. There the library links ws2_32, ntdll and winpthreads.
 
 ```sh
 cmake -S . -B build -G Ninja -DFETCHCONTENT_SOURCE_DIR_CILO=../ciko-cilo
@@ -203,17 +199,19 @@ The tests cover spawns and awaits, nested blocks left early, deadlines and cance
 
 `cinc_bench`, nanoseconds per operation, four workers, the best of three runs on an Apple M4 Pro.
 
-| operation | macOS 27 | Linux 6 arm64, Docker |
-| --- | --- | --- |
-| spawn and await, one at a time | 112 | 123 |
-| spawn and join, 1000 in a block | 55 | 56 |
-| spawn and join, 1000 over four workers | 221 | 236 |
-| context switch, task to scheduler | 19.6 | 19.0 |
-| `cinc_yield` between two tasks | 39 | 38 |
-| rendezvous channel ping pong, one worker | 129 | 141 |
-| rendezvous channel ping pong, two workers | 698 | 1000 |
-| buffered channel, producer on another worker | 47 | 46 |
-| mutex lock and unlock, uncontended | 2.1 | 2.8 |
+| operation | macOS 27 | Linux 6 arm64, Docker | Windows 11 arm64, VM |
+| --- | --- | --- | --- |
+| spawn and await, one at a time | 112 | 123 | 127 |
+| spawn and join, 1000 in a block | 55 | 56 | 53 |
+| spawn and join, 1000 over four workers | 221 | 236 | 199 |
+| context switch, task to scheduler | 19.6 | 19.0 | 18.4 |
+| `cinc_yield` between two tasks | 39 | 38 | 37 |
+| rendezvous channel ping pong, one worker | 129 | 141 | 147 |
+| rendezvous channel ping pong, two workers | 698 | 1000 | 838 |
+| buffered channel, producer on another worker | 47 | 46 | 47 |
+| mutex lock and unlock, uncontended | 2.1 | 2.8 | 8.2 |
+
+Windows on arm64 compiles for ARMv8.0 by default, where an atomic is a loop of exclusive loads and stores, and the mutex takes 3.2 ns with `-march=armv8.1-a`.
 
 A ping pong across workers wakes the other side twice per round trip. While the other worker spins, a wake up is a
 few cache line transfers and no system call. One that already slept takes a few microseconds of kernel wake up.
