@@ -2,8 +2,11 @@
 
 #include <fcntl.h>
 #include <signal.h>
+
+#if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 typedef struct Big {
   alignas(64) double v[8];
@@ -98,6 +101,9 @@ static int body(void *) {
   CHECK(d.task == nullptr);
   CHECK(cinc_join(d.task) == CINC_ERROR_CLOSED);
   // awaiting it is a bug, caught at once.
+#if defined(_WIN32)
+  CHECK(check_child("await") == 3);
+#else
   pid_t pid = fork();
   if (pid == 0) {
     int devnull = open("/dev/null", O_WRONLY);
@@ -108,6 +114,7 @@ static int body(void *) {
   int status;
   waitpid(pid, &status, 0);
   CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+#endif
 
   // groups.
   cinc_group g = {};
@@ -146,7 +153,23 @@ static int spawn_outlived(void *) {
   return 0;
 }
 
-int main(void) {
+#if defined(_WIN32)
+// abort exits with 3 once its dialog and its report are off.
+static int await_detached(void *) {
+  freopen("NUL", "w", stderr);
+  auto d = spawn(late(&detached_done));
+  await(d);
+  return 0;
+}
+#endif
+
+int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv) {
+#if defined(_WIN32)
+  if (argc > 1) {
+    check_quiet();
+    return CINC_RUN(await_detached, nullptr, .workers = 1);
+  }
+#endif
   CHECK(cinc_run(&(cinc_options){.workers = 4}, body, nullptr) == 7);
   CHECK(detached_done == 1);
   // and again, a runtime is not a one off.

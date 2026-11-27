@@ -1,12 +1,18 @@
 #include "check.h"
 
 #include <errno.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#endif
 
 // macOS keeps 128 connections waiting for accept at most, past that it resets them.
 enum { CLIENTS = 120, ROUNDS = 8 };
@@ -16,7 +22,7 @@ static _Atomic(int) served;
 static void serve(int fd) {
   int nodelay = 0;
   socklen_t len = sizeof nodelay;
-  getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, &len);
+  getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (void *)&nodelay, &len);
   CHECK(nodelay);
   char buf[16 << 10];
   size_t n;

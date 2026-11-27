@@ -51,6 +51,10 @@ add_library(cinc STATIC src/runtime.c src/sync.c src/poll.c src/net.c src/switch
 add_library(cinc::cinc ALIAS cinc)
 target_include_directories(cinc PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(cinc PUBLIC cilo::cilo Threads::Threads)
+if(WIN32)
+  # winsock, and ntdll for the afd device the poller waits on.
+  target_link_libraries(cinc PUBLIC ws2_32 ntdll)
+endif()
 target_compile_options(cinc PRIVATE $<$<COMPILE_LANGUAGE:C>:${CINC_C2Y} -Wall -Wextra -Wpedantic>)
 set_target_properties(cinc PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

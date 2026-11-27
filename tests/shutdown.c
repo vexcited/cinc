@@ -15,7 +15,11 @@ static int body(void *) {
     auto a = spawn(waiter());
     auto b = spawn_on(1, waiter());
     cinc_sleep(20);
+#if defined(_WIN32)
+    raise(SIGTERM);
+#else
     kill(getpid(), SIGTERM);
+#endif
     CHECK(await(a) == SIGTERM);
     CHECK(await(b) == SIGTERM);
   }

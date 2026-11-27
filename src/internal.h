@@ -243,8 +243,20 @@ struct cinc__worker {
   cinc_task **timers;
   uint32_t ntimers;
   uint32_t timers_cap;
+#if defined(_WIN32)
+  // an io completion port, the afd device its polls go through, a high resolution timer to sleep on and the packet
+  // that brings its expiry to the port.
+  void *iocp;
+  void *afd;
+  void *timer;
+  void *packet;
+  // spare polls, and the ones the kernel still holds.
+  void *polls;
+  uint32_t inflight;
+#else
   int pfd;
   int efd;
+#endif
 #if CINC__KQUEUE
   struct kevent changes[128];
   int nchanges;
@@ -348,5 +360,14 @@ cinc_error cinc__wq_wait(cinc__thread *th, cinc_task *t, cinc__waiter *w, _Atomi
 [[nodiscard]] bool cinc__poller_init(cinc__worker *w);
 void cinc__poller_close(cinc__worker *w);
 void cinc__poller_wait(cinc__worker *w, uint64_t timeout_ns);
+// wakes a worker blocked in cinc__poller_wait, from any thread.
+void cinc__poller_wake(cinc__worker *w);
+
+#if defined(_WIN32)
+// starts winsock once.
+void cinc__net_init(void);
+// the errno of a winsock error.
+[[gnu::const]] int cinc__errno_of(int wsa_error);
+#endif
 
 #endif

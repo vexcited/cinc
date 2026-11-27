@@ -9,9 +9,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <time.h>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
+#include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 void *cinc__switch(void **from, void *to, void *arg);
 void cinc__trampoline(void);
@@ -30,11 +36,34 @@ static thread_local cinc__thread tls;
 /* time.                                                                                                      */
 /* ========================================================================================================== */
 
+#if defined(_WIN32)
+
+// the performance counter, which is what ciren's clock and winpthreads' CLOCK_MONOTONIC read too. it often runs at
+// 10 MHz, where a nanosecond is a multiplication.
+uint64_t cinc__now_ns(void) {
+  static uint64_t freq, scale;
+  if (CILO_UNLIKELY(!freq)) {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    scale = 1'000'000'000u % (uint64_t)f.QuadPart ? 0 : 1'000'000'000u / (uint64_t)f.QuadPart;
+    freq = (uint64_t)f.QuadPart;
+  }
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  uint64_t c = (uint64_t)now.QuadPart;
+  if (scale) return c * scale;
+  return c / freq * 1'000'000'000u + c % freq * 1'000'000'000u / freq;
+}
+
+#else
+
 uint64_t cinc__now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1'000'000'000u + (uint64_t)ts.tv_nsec;
 }
+
+#endif
 
 [[gnu::const]] static uint64_t after_ms(uint64_t now, uint64_t ms) {
   uint64_t ns, at;
@@ -80,7 +109,7 @@ static cinc__parker *parker_of(cinc__thread *th) {
   cinc__local *l = local_of(th);
   if (CILO_UNLIKELY(!l->parker_ready)) {
     pthread_mutex_init(&l->parker.lock, nullptr);
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
     pthread_cond_init(&l->parker.cond, nullptr);
 #else
     pthread_condattr_t attr;
@@ -126,6 +155,29 @@ static cinc__thread *suspend(cinc__thread *th, cinc__fiber *f, uint32_t action) 
 }
 
 // every fiber runs this loop: one task after the other, parked in the scheduler in between.
+#if defined(_WIN32)
+
+EXCEPTION_DISPOSITION cinc__unhandled(EXCEPTION_RECORD *record, void *frame, CONTEXT *context, void *dispatch);
+
+// the exception handler of the first frame of every fiber. the frames that start a thread, where windows calls the
+// unhandled exception filter, are on another stack, so it is called here, as the start of a windows fiber does.
+// crash reporters set that filter.
+EXCEPTION_DISPOSITION cinc__unhandled(EXCEPTION_RECORD *record, void *, CONTEXT *context, void *) {
+  if (record->ExceptionFlags & EXCEPTION_UNWIND) return ExceptionContinueSearch;
+  EXCEPTION_POINTERS pointers = {.ExceptionRecord = record, .ContextRecord = context};
+  switch (UnhandledExceptionFilter(&pointers)) {
+  case EXCEPTION_CONTINUE_EXECUTION:
+    return ExceptionContinueExecution;
+  case EXCEPTION_CONTINUE_SEARCH:
+    return ExceptionContinueSearch;
+  default:
+    TerminateProcess(GetCurrentProcess(), record->ExceptionCode);
+    return ExceptionContinueSearch;
+  }
+}
+
+#endif
+
 [[noreturn]] static void fiber_main(cinc__fiber *f, [[maybe_unused]] cinc__thread *th) {
 #if CILO_ASAN
   __sanitizer_finish_switch_fiber(nullptr, &th->sched_bottom, &th->sched_size);
@@ -147,12 +199,37 @@ static void fiber_frame(cinc__fiber *f) {
   void **top = (void **)f;
   void (*entry)(cinc__fiber *, cinc__thread *) = fiber_main;
   void (*start)(void) = cinc__trampoline;
-#if defined(__aarch64__)
+#if defined(__aarch64__) && defined(_WIN32)
+  // the registers, then the bounds the TEB gets while the stack runs. two words stay free at the top: windows
+  // dispatches no exception to a frame at StackBase itself, and the trampoline's would be there.
+  void **sp = top - 26;
+  memset(sp, 0, 26 * sizeof(void *));
+  memcpy(&sp[0], &entry, sizeof entry);
+  sp[1] = f;
+  memcpy(&sp[11], &start, sizeof start);
+  sp[20] = top;
+  sp[21] = f->stack;
+  sp[22] = f->map;
+#elif defined(__aarch64__)
   void **sp = top - 20;
   memset(sp, 0, 20 * sizeof(void *));
   memcpy(&sp[0], &entry, sizeof entry);
   sp[1] = f;
   memcpy(&sp[11], &start, sizeof start);
+#elif defined(__x86_64__) && defined(_WIN32)
+  // xmm6 to xmm15, mxcsr and the x87 control word as this thread has them, the bounds for the TEB, the registers
+  // and the trampoline, then the null return address an unwinder stops at.
+  void **sp = top - 36;
+  memset(sp, 0, 36 * sizeof(void *));
+  uint32_t csr[2] = {};
+  __asm__ volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(csr[0]), "=m"(csr[1]));
+  memcpy(&sp[20], csr, sizeof csr);
+  sp[21] = top;
+  sp[22] = f->stack;
+  sp[23] = f->map;
+  sp[28] = f;
+  memcpy(&sp[31], &entry, sizeof entry);
+  memcpy(&sp[33], &start, sizeof start);
 #elif defined(__x86_64__)
   void **sp = top - 10;
   memset(sp, 0, 10 * sizeof(void *));
@@ -170,6 +247,13 @@ static void fiber_frame(cinc__fiber *f) {
 [[nodiscard, gnu::cold, gnu::returns_nonnull]] static cinc__fiber *fiber_new(cinc__runtime *rt) {
   size_t page = rt->page, header = cinc__round_up(sizeof(cinc__fiber) + (8 << 10), page);
   size_t size = page + rt->stack_size + header;
+#if defined(_WIN32)
+  char *m = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  if (!m) cilo_oom(size);
+  // a guard page within DeallocationStack, which the kernel then reports as a stack overflow, as on a thread.
+  DWORD was;
+  VirtualProtect(m, page, PAGE_READWRITE | PAGE_GUARD, &was);
+#else
   int flags = MAP_PRIVATE | MAP_ANON;
 #if defined(MAP_STACK)
   flags |= MAP_STACK;
@@ -177,6 +261,7 @@ static void fiber_frame(cinc__fiber *f) {
   char *m = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
   if (m == MAP_FAILED) cilo_oom(size);
   mprotect(m, page, PROT_NONE);
+#endif
   cinc__fiber *f = (cinc__fiber *)(m + page + rt->stack_size);
   *f = (cinc__fiber){.map = m, .map_size = size, .stack = m + page, .stack_size = rt->stack_size};
   // the rest of the header page is lent to the arenas, so small tasks map no chunk at all.
@@ -193,7 +278,11 @@ static void fiber_free(cinc__fiber *f) {
   cilo_arena_drop(&f->arena);
   cilo_arena_drop(&f->frames);
   for (size_t i = 0; i < countof(f->scratch); i++) cilo_arena_drop(&f->scratch[i]);
+#if defined(_WIN32)
+  VirtualFree(f->map, 0, MEM_RELEASE);
+#else
   munmap(f->map, f->map_size);
+#endif
 }
 
 [[nodiscard, gnu::returns_nonnull]] static cinc__fiber *fiber_get(cinc__worker *w) {
@@ -323,14 +412,7 @@ static void notify(cinc__worker *w) {
   // a load first, so a busy worker's line is not pulled over for nothing.
   if (!atomic_load_explicit(&w->sleeping, memory_order_seq_cst)) return;
   if (!atomic_exchange_explicit(&w->sleeping, 0, memory_order_seq_cst)) return;
-#if CINC__KQUEUE
-  struct kevent ev;
-  EV_SET(&ev, 0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
-  kevent(w->pfd, &ev, 1, nullptr, 0, nullptr);
-#else
-  uint64_t one = 1;
-  [[maybe_unused]] ssize_t n = write(w->efd, &one, sizeof one);
-#endif
+  cinc__poller_wake(w);
 }
 
 // a task already notified is written again: a parker that saw the old notification resets it with an
@@ -391,7 +473,8 @@ static void park_thread(cinc__thread *th, cinc_task *t, uint64_t until) {
     }
     uint64_t now = cinc__now_ns();
     if (now >= until) break;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
+    // a relative wait, which needs no clock.
     uint64_t left = until - now;
     struct timespec ts = {.tv_sec = (time_t)(left / 1'000'000'000u), .tv_nsec = (long)(left % 1'000'000'000u)};
     pthread_cond_timedwait_relative_np(&p->cond, &p->lock, &ts);
@@ -1025,9 +1108,16 @@ int cinc_run(const cinc_options *options, int (*main)(void *arg), void *arg) {
   cinc_options o = options ? *options : (cinc_options){};
 
   cinc__runtime *rt = cilo_calloc(1, sizeof *rt);
+#if defined(_WIN32)
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  long cores = (long)info.dwNumberOfProcessors;
+  rt->page = info.dwPageSize;
+#else
   long cores = sysconf(_SC_NPROCESSORS_ONLN);
-  rt->nworkers = o.workers ? o.workers : cores > 0 ? (uint32_t)cores : 1;
   rt->page = (size_t)sysconf(_SC_PAGESIZE);
+#endif
+  rt->nworkers = o.workers ? o.workers : cores > 0 ? (uint32_t)cores : 1;
   // asan's frames are several times bigger.
   size_t stack = o.stack_size ? o.stack_size : CILO_ASAN ? 256 << 10 : 64 << 10;
   rt->stack_size = cinc__round_up(stack < (16 << 10) ? 16 << 10 : stack, rt->page);

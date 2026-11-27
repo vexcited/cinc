@@ -50,6 +50,28 @@ static void *count(void *p) {
 
 static int inner(void *) { return cinc_in_task() ? 1 : 2; }
 
+#if defined(_WIN32)
+
+// windows polls sockets only, a connected pair stands in for a pipe.
+static int make_pipe(int p[2]) {
+  int listener;
+  if (cinc_listen("127.0.0.1:0", false, &listener)) return -1;
+  cinc_error e = cinc_connect("127.0.0.1", cinc_local_port(listener), &p[1]);
+  if (!e) e = cinc_accept(listener, &p[0]);
+  cinc_close(listener);
+  return e ? -1 : 0;
+}
+
+#else
+
+static int make_pipe(int p[2]) {
+  if (pipe(p)) return -1;
+  fcntl(p[0], F_SETFL, O_NONBLOCK);
+  return 0;
+}
+
+#endif
+
 int main(void) {
   CHECK(!cinc_in_task());
   CHECK(cinc_workers() == 1);
@@ -98,8 +120,7 @@ int main(void) {
 
   // a pipe read honors the deadline, then gets what was written.
   int p[2];
-  CHECK(pipe(p) == 0);
-  fcntl(p[0], F_SETFL, O_NONBLOCK);
+  CHECK(make_pipe(p) == 0);
   char c;
   size_t got;
   within(20) {

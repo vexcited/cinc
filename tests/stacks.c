@@ -2,8 +2,11 @@
 
 #include <signal.h>
 #include <string.h>
+
+#if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 typedef chan(int) Gate;
 
@@ -84,7 +87,15 @@ static int overflow(void *) {
   return 0;
 }
 
-int main(void) {
+int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv) {
+#if defined(_WIN32)
+  if (argc > 1) {
+    check_quiet();
+    return CINC_RUN(overflow, nullptr, .workers = 1);
+  }
+  // running off the end of a stack hits its guard page, which the kernel takes for the end of the task's stack.
+  CHECK(check_child("overflow") == STATUS_STACK_OVERFLOW);
+#else
   // first, while there is a single thread to fork: running off the end of a stack hits its guard page.
   pid_t pid = fork();
   if (pid == 0) {
@@ -96,6 +107,7 @@ int main(void) {
   CHECK(WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0));
   // asan reports the overflow itself and aborts its own way.
   if (WIFSIGNALED(status) && !CILO_ASAN) CHECK(WTERMSIG(status) == SIGSEGV || WTERMSIG(status) == SIGBUS);
+#endif
 
   CHECK(CINC_RUN(body, nullptr, .workers = 2) == 0);
   return check_done("stacks");

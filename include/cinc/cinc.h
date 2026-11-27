@@ -295,6 +295,10 @@ cinc_error cinc_blocking(void (*fn)(void *arg), void *arg);
 
 /* ========================================================================================================== */
 /* io, on posix file descriptors. every call honors the current deadline and cancellation.                    */
+/*                                                                                                            */
+/* on windows an fd is a winsock SOCKET cast to int, which keeps it whole: a handle has 32 significant bits,  */
+/* and INVALID_SOCKET is -1. cast it back with (SOCKET)(intptr_t)fd. a number that is no socket is taken for  */
+/* a crt descriptor, which never waits, as a regular file on posix.                                           */
 /* ========================================================================================================== */
 
 typedef enum cinc_io : uint8_t {
@@ -310,7 +314,15 @@ cinc_error cinc_read(int fd, void *buf, size_t len, size_t *got);
 cinc_error cinc_read_exact(int fd, void *buf, size_t len, size_t *got);
 cinc_error cinc_write_all(int fd, const void *buf, size_t len);
 // writes every buffer in order with as few system calls as possible, for headers and a body.
+#if defined(_WIN32)
+// windows has no sys/uio.h, this is the posix one.
+struct iovec {
+  void *iov_base;
+  size_t iov_len;
+};
+#else
 struct iovec;
+#endif
 cinc_error cinc_writev_all(int fd, const struct iovec *iov, int count);
 // resolves `host` on the blocking pool, then connects without blocking the worker. the socket is non blocking,
 // with TCP_NODELAY and without SIGPIPE.
@@ -326,7 +338,7 @@ cinc_error cinc_accept(int listener, int *fd);
 void cinc_close(int fd);
 
 // whether the kernel spreads connections over sockets listening with `reuse_port`. Linux does: a server listens
-// once per worker and accepts on each. macOS hands every connection to one socket: a server listens once,
+// once per worker and accepts on each. macOS and windows hand every connection to one socket: a server listens once,
 // accepts on one task and spawns each connection with CINC_SPAWN_IN_ON, round robin over the workers.
 #if defined(__linux__)
 #define CINC_REUSEPORT_BALANCES 1
@@ -340,7 +352,8 @@ void cinc_close(int fd);
 
 // waits for SIGINT or SIGTERM and gives which one in `signo`, which may be null. the first call installs the
 // handlers, and once a signal came every call returns right away, in every task. a second signal ends the
-// process the default way, so a stuck shutdown can still be interrupted.
+// process the default way, so a stuck shutdown can still be interrupted. on windows a console's ctrl c and ctrl
+// break are SIGINT, and its closing, a log off and a shut down are SIGTERM, which windows gives a few seconds.
 cinc_error cinc_wait_shutdown(int *signo);
 
 /* ========================================================================================================== */
